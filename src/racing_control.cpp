@@ -264,7 +264,7 @@ void RacingControlNode::MessageProcess(){
                       int bottom = target.rois[0].rect.y_offset + target.rois[0].rect.height;
                       if (target.rois[0].confidence >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_caution_) {
                           // Obstacle is close enough to be cautious, so slow down.
-                          target_linear_speed = 0.3 * avoid_linear_speed_;
+                          target_linear_speed = avoid_linear_speed_;
                           RCLCPP_INFO(this->get_logger(), "Obstacle in caution zone (%d >= %d). Slowing down to %.2f m/s.",
                                       bottom, bottom_threshold_caution_, target_linear_speed);
                           break; // Found one obstacle in caution, no need to check others
