@@ -230,21 +230,35 @@ void RacingControlNode::MessageProcess(){
         break;
 
       case State::RECOVERING_LINE:
-        RCLCPP_INFO(this->get_logger(), "In RECOVERING_LINE state, trying to find a target.");
-        
-        // 优化点 2: 检查是否已找到任何主要目标（线或停车标志）
-        if (hasVisiblePrimaryTarget()) {
-          // 找到了，切换回巡线状态
-          current_state_ = State::LINE_FOLLOWING;
-          RCLCPP_INFO(this->get_logger(), "Primary target (Line or Sign) found! Switching back to LINE_FOLLOWING.");
-        } else {
-          // 未找到，执行“反向转弯”寻找赛道
-          twist_msg.linear.x = recovering_linear_speed_;
-          twist_msg.angular.z = -1.0 * std::copysign(recovering_angular_ratio_, last_avoidance_angular_z_);
-          RCLCPP_INFO(this->get_logger(), "Recovering with Ang_Z: %f", twist_msg.angular.z);
-          publisher_->publish(twist_msg);
+  RCLCPP_INFO(this->get_logger(), "In RECOVERING_LINE state, trying to find a target.");
+  
+  // 优化点 2: 检查是否已找到任何主要目标（线或停车标志）
+  if (hasVisiblePrimaryTarget()) {
+    // 找到了，切换回巡线状态
+    current_state_ = State::LINE_FOLLOWING;
+    RCLCPP_INFO(this->get_logger(), "Primary target (Line or Sign) found! Switching back to LINE_FOLLOWING.");
+  } else {
+    // 检查是否存在障碍物且 bottom >= bottom_threshold_caution_
+    bool obstacle_in_caution_zone = false;
+    if (current_obstacle_msg && !current_obstacle_msg->targets.empty()) {
+        for (const auto &target : current_obstacle_msg->targets) {
+            if(target.type == "construction_cone" && !target.rois.empty()){
+                int bottom = target.rois[0].rect.y_offset + target.rois[0].rect.height;
+                if (target.rois[0].confidence >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_caution_) {
+                    obstacle_in_caution_zone = true;
+                    break;
+                }
+            }
         }
-        break;
+    }
+
+    // 根据检测结果调整线速度
+    twist_msg.linear.x = obstacle_in_caution_zone ? avoid_linear_speed_ : recovering_linear_speed_;
+    twist_msg.angular.z = -1.0 * std::copysign(recovering_angular_ratio_, last_avoidance_angular_z_);
+    RCLCPP_INFO(this->get_logger(), "Recovering with linear speed: %.2f, angular z: %f", twist_msg.linear.x, twist_msg.angular.z);
+    publisher_->publish(twist_msg);
+  }
+  break;
 
       case State::LINE_FOLLOWING:
         // 在巡线状态，也要检查障碍物，因为障碍物可能突然出现
