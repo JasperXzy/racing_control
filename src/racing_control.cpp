@@ -306,9 +306,7 @@ void RacingControlNode::MessageProcess(){
                 publisher_->publish(last_valid_twist_);
             } else {
                 RCLCPP_WARN(this->get_logger(), "No valid target and no history. Cruising straight.");
-                twist_msg.linear.x = cruise_linear_speed_;
-                twist_msg.angular.z = 0.0;
-                publisher_->publish(twist_msg);
+                publisher_->publish(last_valid_twist_);
             }
           }
         }
@@ -393,7 +391,7 @@ bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
 
   last_valid_twist_ = twist_msg;
   last_valid_twist_.linear.x = cruise_linear_speed_; 
-  last_valid_twist_.angular.z = std::copysign(10.0f, angular_z);
+  last_valid_twist_.angular.z = angular_z;
   has_valid_twist_ = true;
 
   publisher_->publish(twist_msg);
