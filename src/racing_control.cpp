@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <chrono> // 用于 std::chrono 时间库
 
+const double LOOP_RATE_HZ = 30.0;
+
 // RacingControlNode 类的构造函数
 RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::NodeOptions& options)
   : rclcpp::Node(node_name, options) {
@@ -101,6 +103,8 @@ void RacingControlNode::subscription_callback_target(const ai_msgs::msg::Percept
 
 // 核心控制逻辑线程
 void RacingControlNode::MessageProcess(){
+  rclcpp::Rate loop_rate(LOOP_RATE_HZ);
+
   while(process_stop_ == false){
     std::unique_lock<std::mutex> lock(point_target_mutex_);
     auto current_line_msg = latest_point_msg_;
@@ -109,8 +113,9 @@ void RacingControlNode::MessageProcess(){
 
     if (!current_line_msg) {
         RCLCPP_INFO(this->get_logger(), "Waiting for track center message...");
-        // 短暂休眠以避免在没有消息时CPU空转
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        loop_rate.sleep();
+
         continue;
     }
 
@@ -235,6 +240,9 @@ void RacingControlNode::MessageProcess(){
         publisher_->publish(twist_msg); // 发布停止指令
         break;
     }
+
+    loop_rate.sleep();
+    
   }
 }
 
