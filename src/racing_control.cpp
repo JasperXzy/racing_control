@@ -190,6 +190,7 @@ void RacingControlNode::MessageProcess(){
         // 在巡线状态，也要检查障碍物，因为障碍物可能突然出现
         if (obstacle_detected_and_close) { // 如果在巡线时发现障碍物，立即切换
             current_state_ = State::OBSTACLE_AVOIDING;
+            has_valid_twist_ = false; // 进入避障时，旧的巡线指令失效
             ObstaclesAvoiding(relevant_obstacle_target);
         } 
         else {
@@ -202,17 +203,29 @@ void RacingControlNode::MessageProcess(){
                 // 高置信度，正常巡线
                 LineFollowing(current_line_msg->targets[0], line_confidence);
               } else {
-                // === 新逻辑：低置信度，慢速直行 ===
-                RCLCPP_WARN(this->get_logger(), "Line confidence (%f) is low. Cruising straight.", line_confidence);
-                twist_msg.linear.x = cruise_linear_speed_;
-                twist_msg.angular.z = 0.0;
-                publisher_->publish(twist_msg);
+                // === 低置信度，重用上一个有效指令 ===
+                if (has_valid_twist_) {
+                    RCLCPP_WARN(this->get_logger(), "Line confidence (%f) is low. Reusing last valid command.", line_confidence);
+                    publisher_->publish(last_valid_twist_);
+                } else {
+                    // 如果从未有过有效指令（例如启动初期），则慢速直行
+                    RCLCPP_WARN(this->get_logger(), "Line confidence low and no valid command history. Cruising straight.");
+                    twist_msg.linear.x = cruise_linear_speed_;
+                    twist_msg.angular.z = 0.0;
+                    publisher_->publish(twist_msg);
+                }
               }
           } else {
-              RCLCPP_WARN(this->get_logger(), "Line message is invalid or empty. Cruising straight.");
-              twist_msg.linear.x = cruise_linear_speed_;
-              twist_msg.angular.z = 0.0;
-              publisher_->publish(twist_msg);
+              // 消息无效，同样重用上一个有效指令
+              if (has_valid_twist_) {
+                  RCLCPP_WARN(this->get_logger(), "Line message is invalid. Reusing last valid command.");
+                  publisher_->publish(last_valid_twist_);
+              } else {
+                  RCLCPP_WARN(this->get_logger(), "Line message invalid and no history. Cruising straight.");
+                  twist_msg.linear.x = cruise_linear_speed_;
+                  twist_msg.angular.z = 0.0;
+                  publisher_->publish(twist_msg);
+              }
           }
         }
         
@@ -241,6 +254,11 @@ void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
 
   twist_msg.linear.x = follow_linear_speed_;
   twist_msg.angular.z = angular_z;
+
+  // --- 存储这个有效的指令 ---
+  last_valid_twist_ = twist_msg;
+  has_valid_twist_ = true;
+
   publisher_->publish(twist_msg);
   RCLCPP_INFO(this->get_logger(), "Line Following -> X:%d, Y:%d, Ang_Z: %f, Lin_X: %f, Conf: %f", x, y, angular_z, follow_linear_speed_, line_confidence);
 }

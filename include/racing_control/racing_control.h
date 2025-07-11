@@ -93,6 +93,9 @@ private:
     State current_state_ = State::LINE_FOLLOWING;
     float last_avoidance_angular_z_ = 0.0; // 新增：记录最后一次避障的角速度
 
+    geometry_msgs::msg::Twist last_valid_twist_;
+    bool has_valid_twist_ = false; // 标志位，确保我们有一个可用的指令
+
     // --- 最新消息存储 ---
     ai_msgs::msg::PerceptionTargets::SharedPtr latest_point_msg_;
     ai_msgs::msg::PerceptionTargets::SharedPtr latest_targets_msg_;
