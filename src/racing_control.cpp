@@ -20,10 +20,6 @@
 // RacingControlNode 类的构造函数
 RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::NodeOptions& options)
   : rclcpp::Node(node_name, options) {
-  
-  auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::duration<double>(avoidance_hold_duration_));
-  avoidance_duration_tolerance_ = rclcpp::Duration(duration_ns);
 
   if (!msg_process_) {
     msg_process_ = std::make_shared<std::thread>(
@@ -59,9 +55,6 @@ RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::
   this->get_parameter<float>("recovering_linear_speed", recovering_linear_speed_);
   this->declare_parameter<float>("recovering_angular_ratio", recovering_angular_ratio_);
   this->get_parameter<float>("recovering_angular_ratio", recovering_angular_ratio_);
-
-  this->declare_parameter<double>("avoidance_hold_duration", avoidance_hold_duration_);
-  this->get_parameter<double>("avoidance_hold_duration", avoidance_hold_duration_);
 
   // === 订阅者和发布者创建 ===
   point_subscriber_ =
@@ -109,12 +102,6 @@ void RacingControlNode::subscription_callback_target(const ai_msgs::msg::Percept
 // 核心控制逻辑线程
 void RacingControlNode::MessageProcess(){
   while(process_stop_ == false){
-    // 动态获取参数
-    this->get_parameter<double>("avoidance_hold_duration", avoidance_hold_duration_);
-    auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-    std::chrono::duration<double>(avoidance_hold_duration_));
-    avoidance_duration_tolerance_ = rclcpp::Duration(duration_ns);
-
     std::unique_lock<std::mutex> lock(point_target_mutex_);
     auto current_line_msg = latest_point_msg_;
     auto current_obstacle_msg = latest_targets_msg_;
@@ -144,9 +131,11 @@ void RacingControlNode::MessageProcess(){
                 if (obstacle_conf >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_) {
                     obstacle_detected_and_close = true;
                     relevant_obstacle_target = target;
-                    current_state_ = State::OBSTACLE_AVOIDING;
-                    last_avoidance_time_ = this->get_clock()->now();
-                    RCLCPP_INFO(this->get_logger(), "Close obstacle detected! Switching to OBSTACLE_AVOIDING.");
+                    // 如果当前不是避障状态，则切换进去
+                    if (current_state_ != State::OBSTACLE_AVOIDING) {
+                        RCLCPP_INFO(this->get_logger(), "Close obstacle detected! Switching to OBSTACLE_AVOIDING.");
+                        current_state_ = State::OBSTACLE_AVOIDING;
+                    }
                     break;
                 }
             }
@@ -158,20 +147,22 @@ void RacingControlNode::MessageProcess(){
 
       case State::OBSTACLE_AVOIDING:
         if (obstacle_detected_and_close) {
+          // 持续检测到障碍物，执行避障
           ObstaclesAvoiding(relevant_obstacle_target);
         } else {
-          rclcpp::Time now = this->get_clock()->now();
-          if (last_avoidance_time_.seconds() > 0 && now > last_avoidance_time_ && (now - last_avoidance_time_) < avoidance_duration_tolerance_) {
-            // 在避障后的短暂保持期内，继续执行最后一次避障动作，确保完全避开
-            RCLCPP_INFO(this->get_logger(), "In post-avoidance hold period, continuing last avoidance move.");
-            twist_msg.linear.x = avoid_linear_speed_; 
-            twist_msg.angular.z = last_avoidance_angular_z_; // 使用最后一次的角速度
-            publisher_->publish(twist_msg);
-          } else {
-            // 保持期结束，切换到寻找赛道状态
-            current_state_ = State::RECOVERING_LINE;
-            RCLCPP_INFO(this->get_logger(), "Avoidance complete. Switching to RECOVERING_LINE.");
-          }
+          // 之前在避障，但现在视野中无障碍物，决策下一步
+          RCLCPP_INFO(this->get_logger(), "Obstacle no longer detected. Deciding next state...");
+          if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
+            !current_line_msg->targets[0].points[0].confidence.empty() && 
+            current_line_msg->targets[0].points[0].confidence[0] >= line_confidence_threshold_) {
+              // 看到了清晰的赛道线，切回巡线
+              current_state_ = State::LINE_FOLLOWING;
+              RCLCPP_INFO(this->get_logger(), "High confidence line found! Switching to LINE_FOLLOWING.");
+            } else {
+              // 没看到赛道线，进入寻找赛道状态
+              current_state_ = State::RECOVERING_LINE;
+              RCLCPP_INFO(this->get_logger(), "No clear line. Switching to RECOVERING_LINE.");
+            }
         }
         break;
 
@@ -186,10 +177,11 @@ void RacingControlNode::MessageProcess(){
           RCLCPP_INFO(this->get_logger(), "High confidence line found! Switching back to LINE_FOLLOWING.");
         } else {
           // 未找到，执行“反向转弯”寻找赛道
-          twist_msg.linear.x = follow_linear_speed_;
+          twist_msg.linear.x = recovering_linear_speed_;
           // last_avoidance_angular_z_ < 0 表示向左转避障，现在需要向右转(>0)寻找
           // last_avoidance_angular_z_ > 0 表示向右转避障，现在需要向左转(<0)寻找
           twist_msg.angular.z = -1.0 * std::copysign(recovering_angular_ratio_, last_avoidance_angular_z_);
+          RCLCPP_INFO(this->get_logger(), "Recovering with Ang_Z: %f", twist_msg.angular.z);
           publisher_->publish(twist_msg);
         }
         break;
@@ -250,7 +242,7 @@ void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
   twist_msg.linear.x = follow_linear_speed_;
   twist_msg.angular.z = angular_z;
   publisher_->publish(twist_msg);
-  RCLCPP_INFO(this->get_logger(), "Line Following -> X:%d, Y:%d, Ang_Z: %f, Lin_X: %f", x, y, angular_z, follow_linear_speed_);
+  RCLCPP_INFO(this->get_logger(), "Line Following -> X:%d, Y:%d, Ang_Z: %f, Lin_X: %f, Conf: %f", x, y, angular_z, follow_linear_speed_, line_confidence);
 }
 
 // 避障控制函数
@@ -266,12 +258,15 @@ void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
 
   float angular_z_avoid = 0.0f;
 
-  if(obstacle_center_offset < 5.0f && obstacle_center_offset >= 0) obstacle_center_offset = 5.0f;
-  else if(obstacle_center_offset > -5.0f && obstacle_center_offset <0) obstacle_center_offset = -5.0f; 
+  if(obstacle_center_offset < 5.0f && obstacle_center_offset >= 0) {
+    obstacle_center_offset = 5.0f;
+  } else if(obstacle_center_offset > -5.0f && obstacle_center_offset < 0) {
+    obstacle_center_offset = -5.0f;
+  }
 
   angular_z_avoid = -1.0f * avoid_angular_ratio_ * std::min(4.0f, (320.0f / obstacle_center_offset));
 
-  // --- 新逻辑：记录这次避障的转向角速度 ---
+  // --- 记录这次避障的转向角速度，以备恢复赛道时使用 ---
   last_avoidance_angular_z_ = angular_z_avoid;
 
   twist_msg.linear.x = avoid_linear_speed_;

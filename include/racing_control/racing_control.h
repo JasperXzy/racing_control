@@ -26,7 +26,6 @@
 #include "geometry_msgs/msg/point_stamped.hpp" // If this is actually used, keep it
 #include "geometry_msgs/msg/twist.hpp"
 #include "ai_msgs/msg/perception_targets.hpp"
-// 引入 geometry_msgs, 因为 ai_msgs::msg::Point 内部使用了它
 #include "geometry_msgs/msg/point32.hpp"
 
 enum class State {
@@ -92,9 +91,6 @@ private:
 
     // --- 状态机变量 ---
     State current_state_ = State::LINE_FOLLOWING;
-    rclcpp::Time last_avoidance_time_;
-    double avoidance_hold_duration_ = 1.0;
-    rclcpp::Duration avoidance_duration_tolerance_{0, 0};
     float last_avoidance_angular_z_ = 0.0; // 新增：记录最后一次避障的角速度
 
     // --- 最新消息存储 ---
