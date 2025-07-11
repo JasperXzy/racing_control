@@ -17,8 +17,6 @@
 #include <unistd.h>
 #include <chrono> // 用于 std::chrono 时间库
 
-const double LOOP_RATE_HZ = 30.0;
-
 // RacingControlNode 类的构造函数
 RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::NodeOptions& options)
   : rclcpp::Node(node_name, options) {
@@ -110,8 +108,6 @@ void RacingControlNode::subscription_callback_target(const ai_msgs::msg::Percept
 
 // 核心控制逻辑线程
 void RacingControlNode::MessageProcess(){
-  rclcpp::Rate loop_rate(LOOP_RATE_HZ);
-
   while(process_stop_ == false){
     // 动态获取参数
     this->get_parameter<double>("avoidance_hold_duration", avoidance_hold_duration_);
@@ -126,7 +122,8 @@ void RacingControlNode::MessageProcess(){
 
     if (!current_line_msg) {
         RCLCPP_INFO(this->get_logger(), "Waiting for track center message...");
-        loop_rate.sleep();
+        // 短暂休眠以避免在没有消息时CPU空转
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         continue;
     }
 
@@ -204,32 +201,28 @@ void RacingControlNode::MessageProcess(){
             ObstaclesAvoiding(relevant_obstacle_target);
         } 
         else {
-          float line_confidence = current_line_msg->targets[0].points[0].confidence[0];
-          LineFollowing(current_line_msg->targets[0], line_confidence);
-        }
-        /*{
-            // 没有障碍物，正常巡线
-            if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
-                !current_line_msg->targets[0].points[0].point.empty() && !current_line_msg->targets[0].points[0].confidence.empty()) {
-                
-                float line_confidence = current_line_msg->targets[0].points[0].confidence[0];
-                if (line_confidence >= line_confidence_threshold_) {
-                  // 高置信度，正常巡线
-                  LineFollowing(current_line_msg->targets[0], line_confidence);
-                } else {
-                  // === 新逻辑：低置信度，慢速直行 ===
-                  RCLCPP_WARN(this->get_logger(), "Line confidence (%f) is low. Cruising straight.", line_confidence);
-                  twist_msg.linear.x = cruise_linear_speed_;
-                  twist_msg.angular.z = 0.0;
-                  publisher_->publish(twist_msg);
-                }
-            } else {
-                RCLCPP_WARN(this->get_logger(), "Line message is invalid or empty. Cruising straight.");
+          // 正常巡线
+          if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
+              !current_line_msg->targets[0].points[0].point.empty() && !current_line_msg->targets[0].points[0].confidence.empty()) {
+              
+              float line_confidence = current_line_msg->targets[0].points[0].confidence[0];
+              if (line_confidence >= line_confidence_threshold_) {
+                // 高置信度，正常巡线
+                LineFollowing(current_line_msg->targets[0], line_confidence);
+              } else {
+                // === 新逻辑：低置信度，慢速直行 ===
+                RCLCPP_WARN(this->get_logger(), "Line confidence (%f) is low. Cruising straight.", line_confidence);
                 twist_msg.linear.x = cruise_linear_speed_;
                 twist_msg.angular.z = 0.0;
                 publisher_->publish(twist_msg);
-            }
-        }*/
+              }
+          } else {
+              RCLCPP_WARN(this->get_logger(), "Line message is invalid or empty. Cruising straight.");
+              twist_msg.linear.x = cruise_linear_speed_;
+              twist_msg.angular.z = 0.0;
+              publisher_->publish(twist_msg);
+          }
+        }
         
         break;
       
@@ -237,8 +230,6 @@ void RacingControlNode::MessageProcess(){
         publisher_->publish(twist_msg); // 发布停止指令
         break;
     }
-    
-    loop_rate.sleep();
   }
 }
 
@@ -274,25 +265,11 @@ void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
   float obstacle_center_offset = static_cast<float>(center_x) - 320.0f; 
 
   float angular_z_avoid = 0.0f;
-  
-  // 如果障碍物在中心，强制向一个固定方向转（例如，左转，角速度为负）
-  /*
-  if (std::abs(obstacle_center_offset) < 30.0f) {
-      angular_z_avoid = -1.0f * std::abs(avoid_angular_ratio_);
-  } else {
-      // 障碍物在右侧(offset>0)，向左转(angular<0)；在左侧则相反。
-      // 所以角速度方向与偏移量符号相反。
-      angular_z_avoid = -1.0f * avoid_angular_ratio_ * (obstacle_center_offset / 320.0f);
-  }
-  */
-  
+
   if(obstacle_center_offset < 5.0f && obstacle_center_offset >= 0) obstacle_center_offset = 5.0f;
   else if(obstacle_center_offset > -5.0f && obstacle_center_offset <0) obstacle_center_offset = -5.0f; 
 
   angular_z_avoid = -1.0f * avoid_angular_ratio_ * std::min(4.0f, (320.0f / obstacle_center_offset));
-
-  // 限制最大角速度，防止转向过快
-  //angular_z_avoid = std::max(-2.0f, std::min(2.0f, angular_z_avoid));
 
   // --- 新逻辑：记录这次避障的转向角速度 ---
   last_avoidance_angular_z_ = angular_z_avoid;
