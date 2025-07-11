@@ -1,19 +1,4 @@
-# Copyright (c) 2022，Horizon Robotics.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import os
-
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.actions import IncludeLaunchDescription
@@ -25,40 +10,35 @@ from ament_index_python import get_package_share_directory
 
 
 def generate_launch_description():
-
     return LaunchDescription([
         DeclareLaunchArgument(
             'avoid_angular_ratio',
             default_value='0.2',
-            description='image subscribe topic name'),
+            description='angular speed ratio for obstacle avoidance'),
         DeclareLaunchArgument(
             'avoid_linear_speed',
             default_value='0.1',
-            description='image subscribe topic name'),
+            description='linear speed for obstacle avoidance'),
         DeclareLaunchArgument(
             'follow_angular_ratio',
             default_value='-1.0',
-            description='image subscribe topic name'),
+            description='angular speed ratio for line following'),
         DeclareLaunchArgument(
             'follow_linear_speed',
             default_value='0.1',
-            description='image subscribe topic name'),
+            description='linear speed for line following'),
         DeclareLaunchArgument(
             'bottom_threshold',
             default_value='200',
-            description='image subscribe topic name'),
+            description='bottom threshold for line following'),
         DeclareLaunchArgument(
             'line_confidence_threshold',
             default_value='0.5',
-            description='image subscribe topic name'),
+            description='confidence threshold for line following'),
         DeclareLaunchArgument(
             'obstacle_confidence_threshold',
             default_value='0.5',
-            description='image subscribe topic name'),
-        DeclareLaunchArgument(
-            'avoidance_hold_duration',
-            default_value='0.5',
-            description='Duration to hold the avoidance maneuver when an obstacle is detected'),
+            description='confidence threshold for obstacle avoidance'),
         Node(
             package='racing_control',
             executable='racing_control',
@@ -72,9 +52,7 @@ def generate_launch_description():
                 {"bottom_threshold": LaunchConfiguration('bottom_threshold')},
                 {"line_confidence_threshold": LaunchConfiguration('line_confidence_threshold')},
                 {"obstacle_confidence_threshold": LaunchConfiguration('obstacle_confidence_threshold')},
-                {"avoidance_hold_duration": LaunchConfiguration('avoidance_hold_duration')}
             ],
             arguments=['--ros-args', '--log-level', 'warn']
         )
-
     ])
