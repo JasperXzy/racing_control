@@ -1,21 +1,6 @@
-// Copyright (c) 2022，Horizon Robotics.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #include "racing_control/racing_control.h"
-
 #include <unistd.h>
-#include <chrono> // 用于 std::chrono 时间库
+#include <chrono>
 
 const double LOOP_RATE_HZ = 30.0;
 
@@ -28,7 +13,7 @@ RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::
         std::bind(&RacingControlNode::MessageProcess, this));
   }
 
-  // === 参数声明和获取 ===
+  // 参数声明和获取 
   this->declare_parameter<std::string>("pub_control_topic", pub_control_topic_);
   this->get_parameter<std::string>("pub_control_topic", pub_control_topic_);
 
@@ -50,7 +35,7 @@ RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::
   this->declare_parameter<int>("bottom_threshold", bottom_threshold_);
   this->get_parameter<int>("bottom_threshold", bottom_threshold_);
 
-  // 新增：特殊状态下的参数
+  // 特殊状态下的参数
   this->declare_parameter<float>("cruise_linear_speed", cruise_linear_speed_);
   this->get_parameter<float>("cruise_linear_speed", cruise_linear_speed_);
   this->declare_parameter<float>("recovering_linear_speed", recovering_linear_speed_);
@@ -58,16 +43,24 @@ RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::
   this->declare_parameter<float>("recovering_angular_ratio", recovering_angular_ratio_);
   this->get_parameter<float>("recovering_angular_ratio", recovering_angular_ratio_);
 
-  // === 订阅者和发布者创建 ===
+  // 订阅者和发布者创建
   point_subscriber_ =
     this->create_subscription<ai_msgs::msg::PerceptionTargets>(
-      "racing_track_center_detection", rclcpp::SensorDataQoS(),
+      "racing_track_center_detection", 
+      rclcpp::SensorDataQoS(),
       std::bind(&RacingControlNode::subscription_callback_point, this, std::placeholders::_1)); 
 
   target_subscriber_ =
     this->create_subscription<ai_msgs::msg::PerceptionTargets>(
-      "racing_obstacle_detection", rclcpp::SensorDataQoS(),
+      "racing_obstacle_detection", 
+      rclcpp::SensorDataQoS(),
       std::bind(&RacingControlNode::subscription_callback_target, this, std::placeholders::_1)); 
+
+  // 订阅 /sign4return
+  sign_subscriber_ = this->create_subscription<std_msgs::msg::Int32>(
+    "/sign4return",
+    rclcpp::SensorDataQoS(),
+    std::bind(&RacingControlNode::sign_callback, this, std::placeholders::_1));
   
   publisher_ = this->create_publisher<geometry_msgs::msg::Twist>(pub_control_topic_, 5);
   
@@ -80,6 +73,31 @@ RacingControlNode::~RacingControlNode(){
     process_stop_ = true;
     msg_process_->join();
     msg_process_ = nullptr;
+  }
+}
+
+// /sign4return 的回调函数
+void RacingControlNode::sign_callback(const std_msgs::msg::Int32::SharedPtr msg) {
+  int sign_value = msg->data;
+  RCLCPP_INFO(this->get_logger(), "Received sign4return: %d", sign_value);
+  
+  if (sign_value == 5) {
+    // 收到5时，挂起控制节点
+    RCLCPP_WARN(this->get_logger(), "Suspending control node (manual override).");
+    is_suspended_ = true;
+    // 立即发布停止指令
+    auto stop_msg = geometry_msgs::msg::Twist();
+    stop_msg.linear.x = 0.0;
+    stop_msg.angular.z = 0.0;
+    publisher_->publish(stop_msg);
+
+  } else if (sign_value == 6) {
+    // 收到6时，恢复控制
+    RCLCPP_INFO(this->get_logger(), "Resuming control node.");
+    is_suspended_ = false;
+    // 将状态机重置为默认巡线状态，避免从异常状态恢复
+    current_state_ = State::LINE_FOLLOWING;
+    has_valid_twist_ = false; // 清除旧的指令历史
   }
 }
 
@@ -106,6 +124,13 @@ void RacingControlNode::MessageProcess(){
   rclcpp::Rate loop_rate(LOOP_RATE_HZ);
 
   while(process_stop_ == false){
+    // 检查节点是否被挂起
+    if (is_suspended_) {
+      // 如果被挂起，则不执行任何控制逻辑，仅循环等待
+      loop_rate.sleep();
+      continue;
+    }
+
     std::unique_lock<std::mutex> lock(point_target_mutex_);
     auto current_line_msg = latest_point_msg_;
     auto current_obstacle_msg = latest_targets_msg_;
@@ -113,9 +138,7 @@ void RacingControlNode::MessageProcess(){
 
     if (!current_line_msg) {
         RCLCPP_INFO(this->get_logger(), "Waiting for track center message...");
-
         loop_rate.sleep();
-
         continue;
     }
 
@@ -123,7 +146,7 @@ void RacingControlNode::MessageProcess(){
     twist_msg.linear.x = 0.0;
     twist_msg.angular.z = 0.0;
 
-    // --- 状态机决策 ---
+    // 状态机决策
     bool obstacle_detected_and_close = false;
     ai_msgs::msg::Target relevant_obstacle_target;
 
@@ -208,7 +231,7 @@ void RacingControlNode::MessageProcess(){
                 // 高置信度，正常巡线
                 LineFollowing(current_line_msg->targets[0], line_confidence);
               } else {
-                // === 低置信度，重用上一个有效指令 ===
+                // 低置信度，重用上一个有效指令
                 if (has_valid_twist_) {
                     RCLCPP_WARN(this->get_logger(), "Line confidence (%f) is low. Reusing last valid command.", line_confidence);
                     publisher_->publish(last_valid_twist_);
@@ -263,7 +286,7 @@ void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
   twist_msg.linear.x = follow_linear_speed_;
   twist_msg.angular.z = angular_z;
 
-  // --- 存储这个有效的指令 ---
+  // 存储这个有效的指令
   last_valid_twist_ = twist_msg;
   has_valid_twist_ = true;
 
@@ -292,7 +315,7 @@ void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
 
   angular_z_avoid = -1.0f * avoid_angular_ratio_ * std::min(4.0f, (320.0f / obstacle_center_offset));
 
-  // --- 记录这次避障的转向角速度，以备恢复赛道时使用 ---
+  // 记录这次避障的转向角速度，以备恢复赛道时使用
   last_avoidance_angular_z_ = angular_z_avoid;
 
   twist_msg.linear.x = avoid_linear_speed_;
@@ -303,11 +326,9 @@ void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
 
 // 主函数
 int main(int argc, char* argv[]) {
-  rclcpp::init(argc, argv); // 初始化ROS 2
-  // 使用合适的节点名 "racing_control" 创建并运行节点
+  rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<RacingControlNode>("racing_control"));
+  rclcpp::shutdown();
   RCLCPP_WARN(rclcpp::get_logger("racing_control"), "Pkg exit.");
-  rclcpp::shutdown(); // 关闭ROS 2
-
   return 0;
 }
