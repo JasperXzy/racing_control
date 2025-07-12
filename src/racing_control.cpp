@@ -61,24 +61,16 @@ RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::
   // === 订阅者和发布者创建 ===
   point_subscriber_ =
     this->create_subscription<ai_msgs::msg::PerceptionTargets>(
-      "racing_track_center_detection",
-      rclcpp::SensorDataQoS(),
-      std::bind(&RacingControlNode::subscription_callback_point, this, std::placeholders::_1));
+      "racing_track_center_detection", rclcpp::SensorDataQoS(),
+      std::bind(&RacingControlNode::subscription_callback_point, this, std::placeholders::_1)); 
 
   target_subscriber_ =
     this->create_subscription<ai_msgs::msg::PerceptionTargets>(
-      "racing_obstacle_detection",
-      rclcpp::SensorDataQoS(),
-      std::bind(&RacingControlNode::subscription_callback_target, this, std::placeholders::_1));
-
+      "racing_obstacle_detection", rclcpp::SensorDataQoS(),
+      std::bind(&RacingControlNode::subscription_callback_target, this, std::placeholders::_1)); 
+  
   publisher_ = this->create_publisher<geometry_msgs::msg::Twist>(pub_control_topic_, 5);
-
-  // 订阅 /sign4return 话题
-  sign_subscriber_ = this->create_subscription<std_msgs::msg::Int32>(
-    "/sign4return",
-    rclcpp::SensorDataQoS(),
-    std::bind(&RacingControlNode::sign_callback, this, std::placeholders::_1));
-
+  
   RCLCPP_INFO(rclcpp::get_logger("RacingControlNode"), "RacingControlNode initialized!");
 }
 
@@ -89,27 +81,6 @@ RacingControlNode::~RacingControlNode(){
     msg_process_->join();
     msg_process_ = nullptr;
   }
-}
-
-// sign_callback 函数，处理 /sign4return 消息
-void RacingControlNode::sign_callback(const std_msgs::msg::Int32::SharedPtr msg) {
-  int sign_value = msg->data;
-  RCLCPP_INFO(this->get_logger(), "Received sign4return: %d", sign_value);
-
-  // 使用互斥锁保护状态变量，防止与 MessageProcess 线程冲突
-  std::unique_lock<std::mutex> lock(point_target_mutex_);
-  if (sign_value == 5) {
-    if (current_state_ != State::STOP) {
-      current_state_ = State::STOP;
-      RCLCPP_INFO(this->get_logger(), "Switching to STOP state.");
-    }
-  } else if (sign_value == 6) {
-    if (current_state_ == State::STOP) { // 只有在STOP状态下才切换回LINE_FOLLOWING
-      current_state_ = State::LINE_FOLLOWING;
-      RCLCPP_INFO(this->get_logger(), "Switching to LINE_FOLLOWING state.");
-    }
-  }
-  // unlock occurs automatically when lock goes out of scope
 }
 
 // 中线消息回调
@@ -136,25 +107,23 @@ void RacingControlNode::MessageProcess(){
 
   while(process_stop_ == false){
     std::unique_lock<std::mutex> lock(point_target_mutex_);
-    State current_running_state = current_state_; // 获取当前状态拷贝，避免在锁内长时间操作
     auto current_line_msg = latest_point_msg_;
     auto current_obstacle_msg = latest_targets_msg_;
-    lock.unlock(); // 释放锁，允许回调函数更新最新消息和状态
+    lock.unlock();
+
+    if (!current_line_msg) {
+        RCLCPP_INFO(this->get_logger(), "Waiting for track center message...");
+
+        loop_rate.sleep();
+
+        continue;
+    }
 
     auto twist_msg = geometry_msgs::msg::Twist();
     twist_msg.linear.x = 0.0;
     twist_msg.angular.z = 0.0;
 
     // --- 状态机决策 ---
-    // 如果当前状态是STOP，则优先执行停止逻辑
-    if (current_running_state == State::STOP) {
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "In STOP state. Publishing zero velocity.");
-        publisher_->publish(twist_msg); // 发布停止指令
-        loop_rate.sleep();
-        continue; // 跳过后续的正常逻辑，直到状态改变
-    }
-
-    // 只有在非STOP状态下，才进行障碍物和巡线判断
     bool obstacle_detected_and_close = false;
     ai_msgs::msg::Target relevant_obstacle_target;
 
@@ -168,21 +137,18 @@ void RacingControlNode::MessageProcess(){
                     obstacle_detected_and_close = true;
                     relevant_obstacle_target = target;
                     // 如果当前不是避障状态，则切换进去
-                    if (current_running_state != State::OBSTACLE_AVOIDING) {
+                    if (current_state_ != State::OBSTACLE_AVOIDING) {
                         RCLCPP_INFO(this->get_logger(), "Close obstacle detected! Switching to OBSTACLE_AVOIDING.");
-                        std::unique_lock<std::mutex> set_state_lock(point_target_mutex_);
                         current_state_ = State::OBSTACLE_AVOIDING;
-                        set_state_lock.unlock();
-                        current_running_state = State::OBSTACLE_AVOIDING; // 更新本地变量
                     }
                     break;
                 }
             }
         }
     }
-
+    
     // 2. 根据当前状态执行动作
-    switch(current_running_state) {
+    switch(current_state_) {
 
       case State::OBSTACLE_AVOIDING:
         if (obstacle_detected_and_close) {
@@ -191,10 +157,8 @@ void RacingControlNode::MessageProcess(){
         } else {
           // 之前在避障，但现在视野中无障碍物，决策下一步
           RCLCPP_INFO(this->get_logger(), "Obstacle no longer detected. Deciding next state...");
-          // 在修改状态前再次获取锁
-          std::unique_lock<std::mutex> set_state_lock(point_target_mutex_);
           if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
-            !current_line_msg->targets[0].points[0].confidence.empty() &&
+            !current_line_msg->targets[0].points[0].confidence.empty() && 
             current_line_msg->targets[0].points[0].confidence[0] >= line_confidence_threshold_) {
               // 看到了清晰的赛道线，切回巡线
               current_state_ = State::LINE_FOLLOWING;
@@ -204,20 +168,17 @@ void RacingControlNode::MessageProcess(){
               current_state_ = State::RECOVERING_LINE;
               RCLCPP_INFO(this->get_logger(), "No clear line. Switching to RECOVERING_LINE.");
             }
-          set_state_lock.unlock(); // 释放锁
         }
         break;
 
       case State::RECOVERING_LINE:
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "In RECOVERING_LINE state, trying to find the track.");
+        RCLCPP_INFO(this->get_logger(), "In RECOVERING_LINE state, trying to find the track.");
         // 检查是否已找到高置信度的赛道线
         if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
-            !current_line_msg->targets[0].points[0].confidence.empty() &&
+            !current_line_msg->targets[0].points[0].confidence.empty() && 
             current_line_msg->targets[0].points[0].confidence[0] >= line_confidence_threshold_) {
           // 切换回巡线状态
-          std::unique_lock<std::mutex> set_state_lock(point_target_mutex_); // 获取锁以修改状态
           current_state_ = State::LINE_FOLLOWING;
-          set_state_lock.unlock(); // 释放锁
           RCLCPP_INFO(this->get_logger(), "High confidence line found! Switching back to LINE_FOLLOWING.");
         } else {
           // 未找到，执行“反向转弯”寻找赛道
@@ -232,31 +193,28 @@ void RacingControlNode::MessageProcess(){
 
       case State::LINE_FOLLOWING:
         // 在巡线状态，也要检查障碍物，因为障碍物可能突然出现
-        if (obstacle_detected_and_close) { // 如果在巡线时发现障碍物，已在上面切换状态
+        if (obstacle_detected_and_close) { // 如果在巡线时发现障碍物，立即切换
+            current_state_ = State::OBSTACLE_AVOIDING;
+            has_valid_twist_ = false; // 进入避障时，旧的巡线指令失效
             ObstaclesAvoiding(relevant_obstacle_target);
-        }
+        } 
         else {
           // 正常巡线
-          if (!current_line_msg) {
-             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "No track center message received yet. Cruising straight.");
-             twist_msg.linear.x = cruise_linear_speed_;
-             twist_msg.angular.z = 0.0;
-             publisher_->publish(twist_msg);
-          } else if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
+          if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
               !current_line_msg->targets[0].points[0].point.empty() && !current_line_msg->targets[0].points[0].confidence.empty()) {
-
+              
               float line_confidence = current_line_msg->targets[0].points[0].confidence[0];
               if (line_confidence >= line_confidence_threshold_) {
                 // 高置信度，正常巡线
                 LineFollowing(current_line_msg->targets[0], line_confidence);
               } else {
-                // 低置信度，重用上一个有效指令
+                // === 低置信度，重用上一个有效指令 ===
                 if (has_valid_twist_) {
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Line confidence (%f) is low. Reusing last valid command.", line_confidence);
+                    RCLCPP_WARN(this->get_logger(), "Line confidence (%f) is low. Reusing last valid command.", line_confidence);
                     publisher_->publish(last_valid_twist_);
                 } else {
                     // 如果从未有过有效指令（例如启动初期），则慢速直行
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Line confidence low and no valid command history. Cruising straight.");
+                    RCLCPP_WARN(this->get_logger(), "Line confidence low and no valid command history. Cruising straight.");
                     twist_msg.linear.x = cruise_linear_speed_;
                     twist_msg.angular.z = 0.0;
                     publisher_->publish(twist_msg);
@@ -265,51 +223,47 @@ void RacingControlNode::MessageProcess(){
           } else {
               // 消息无效，同样重用上一个有效指令
               if (has_valid_twist_) {
-                  RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Line message is invalid. Reusing last valid command.");
+                  RCLCPP_WARN(this->get_logger(), "Line message is invalid. Reusing last valid command.");
                   publisher_->publish(last_valid_twist_);
               } else {
-                  RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Line message invalid and no history. Cruising straight.");
+                  RCLCPP_WARN(this->get_logger(), "Line message invalid and no history. Cruising straight.");
                   twist_msg.linear.x = cruise_linear_speed_;
                   twist_msg.angular.z = 0.0;
                   publisher_->publish(twist_msg);
               }
           }
         }
+        
         break;
-
-      case State::STOP: // 理论上已经由前面的 if (current_running_state == State::STOP) 捕获，但为了代码完整性保留
-        publisher_->publish(twist_msg); // 发布停止指令
-        break;
-
-      default: // 未知状态，安全起见停止
-        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Unknown state encountered. Stopping vehicle. State: %d", static_cast<int>(current_running_state));
+      
+      default: // 包括 STOP 状态
         publisher_->publish(twist_msg); // 发布停止指令
         break;
     }
 
     loop_rate.sleep();
-
+    
   }
 }
 
 // 巡线控制函数
 void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence){
   if (line_target.points.empty() || line_target.points[0].point.empty()) { return; }
-
+  
   int x = static_cast<int>(line_target.points[0].point[0].x);
   int y = static_cast<int>(line_target.points[0].point[0].y);
   float center_offset = static_cast<float>(x) - 320.0f;
   if (std::abs(center_offset) < 5.0f) { center_offset = 0.0f; }
-
+  
   auto twist_msg = geometry_msgs::msg::Twist();
   float line_y_relative = (static_cast<float>(y) - 256.0f) / (480.0f - 256.0f);
   line_y_relative = std::max(0.0f, std::min(1.0f, line_y_relative));
-  float angular_z = follow_angular_ratio_ * (center_offset / 320.0f) * line_y_relative;
+  float angular_z = follow_angular_ratio_ * (center_offset / 320.0f) * line_y_relative; 
 
   twist_msg.linear.x = follow_linear_speed_;
   twist_msg.angular.z = angular_z;
 
-  //  存储这个有效的指令 
+  // --- 存储这个有效的指令 ---
   last_valid_twist_ = twist_msg;
   has_valid_twist_ = true;
 
@@ -321,12 +275,12 @@ void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
 void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
   if (target.rois.empty() || target.rois[0].rect.width == 0) {
       RCLCPP_ERROR(this->get_logger(), "CRITICAL: ObstaclesAvoiding called with invalid ROI data!");
-      return;
+      return; 
   }
 
   auto twist_msg = geometry_msgs::msg::Twist();
   int center_x = target.rois[0].rect.x_offset + target.rois[0].rect.width / 2;
-  float obstacle_center_offset = static_cast<float>(center_x) - 320.0f;
+  float obstacle_center_offset = static_cast<float>(center_x) - 320.0f; 
 
   float angular_z_avoid = 0.0f;
 
@@ -338,7 +292,7 @@ void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
 
   angular_z_avoid = -1.0f * avoid_angular_ratio_ * std::min(4.0f, (320.0f / obstacle_center_offset));
 
-  // 记录这次避障的转向角速度，以备恢复赛道时使用 
+  // --- 记录这次避障的转向角速度，以备恢复赛道时使用 ---
   last_avoidance_angular_z_ = angular_z_avoid;
 
   twist_msg.linear.x = avoid_linear_speed_;
@@ -349,9 +303,11 @@ void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
 
 // 主函数
 int main(int argc, char* argv[]) {
-  rclcpp::init(argc, argv);
+  rclcpp::init(argc, argv); // 初始化ROS 2
+  // 使用合适的节点名 "racing_control" 创建并运行节点
   rclcpp::spin(std::make_shared<RacingControlNode>("racing_control"));
-  rclcpp::shutdown();
   RCLCPP_WARN(rclcpp::get_logger("racing_control"), "Pkg exit.");
+  rclcpp::shutdown(); // 关闭ROS 2
+
   return 0;
 }
