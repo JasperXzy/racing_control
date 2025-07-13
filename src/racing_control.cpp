@@ -273,29 +273,67 @@ void RacingControlNode::MessageProcess(){
 
 // 巡线控制函数
 void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence){
-  if (line_target.points.empty() || line_target.points[0].point.empty()) { return; }
-   
-  int x = static_cast<int>(line_target.points[0].point[0].x);
-  int y = static_cast<int>(line_target.points[0].point[0].y);
-  float center_offset = static_cast<float>(x) - 320.0f;
+  
+  bool use_parking_sign = false;
+  int target_x = 0;
+  int target_y = 0;
+  std::string log_reason = "Line";
+
+  // 1. 优先检查是否存在 "parking_sign"
+  {
+    // 访问共享数据前加锁
+    std::unique_lock<std::mutex> lock(point_target_mutex_);
+    if (latest_targets_msg_ && !latest_targets_msg_->targets.empty()) {
+      for (const auto& target : latest_targets_msg_->targets) {
+        // 找到了停车标志，并且它有有效的ROI
+        if (target.type == "parking_sign" && !target.rois.empty()) {
+          // 使用停车标志的ROI中心点作为巡航目标
+          target_x = target.rois[0].rect.x_offset + target.rois[0].rect.width / 2;
+          target_y = target.rois[0].rect.y_offset + target.rois[0].rect.height / 2;
+          use_parking_sign = true;
+          log_reason = "Parking Sign";
+          // 找到一个就跳出循环，优先使用第一个检测到的
+          break; 
+        }
+      }
+    }
+  } // 互斥锁在此处自动释放
+
+  // 2. 如果没有找到停车标志，则使用常规的赛道线
+  if (!use_parking_sign) {
+    if (line_target.points.empty() || line_target.points[0].point.empty()) {
+      RCLCPP_WARN(this->get_logger(), "LineFollowing called with invalid line_target data.");
+      return; // 如果常规赛道线也无效，则直接返回
+    }
+    target_x = static_cast<int>(line_target.points[0].point[0].x);
+    target_y = static_cast<int>(line_target.points[0].point[0].y);
+  }
+
+  // 3. 根据最终确定的目标点 (target_x, target_y) 计算并发布控制指令
+  float center_offset = static_cast<float>(target_x) - 320.0f;
   if (std::abs(center_offset) < 5.0f) { center_offset = 0.0f; }
   
   auto twist_msg = geometry_msgs::msg::Twist();
-  float line_y_relative = (static_cast<float>(y) - 256.0f) / (480.0f - 256.0f);
-  line_y_relative = std::max(0.0f, std::min(1.0f, line_y_relative));
-  float angular_z = follow_angular_ratio_ * (center_offset / 320.0f) * line_y_relative; 
+  // 使用目标点的Y坐标来调整角速度响应的权重
+  float target_y_relative = (static_cast<float>(target_y) - 256.0f) / (480.0f - 256.0f);
+  target_y_relative = std::max(0.0f, std::min(1.0f, target_y_relative)); // 归一化到 [0, 1]
+  
+  float angular_z = follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
 
   twist_msg.linear.x = follow_linear_speed_;
   twist_msg.angular.z = angular_z;
 
   // 存储这个有效的指令
   last_valid_twist_ = twist_msg;
-  last_valid_twist_.linear.x = cruise_linear_speed_;
+  // 更新备用指令，当置信度低时使用
+  // 这里可以根据实际情况微调，比如转弯幅度可以设大一点确保能回到赛道
+  last_valid_twist_.linear.x = cruise_linear_speed_; 
   last_valid_twist_.angular.z = std::copysign(10.0f, angular_z);
   has_valid_twist_ = true;
 
   publisher_->publish(twist_msg);
-  RCLCPP_INFO(this->get_logger(), "Line Following -> X:%d, Y:%d, Ang_Z: %f, Lin_X: %f, Conf: %f", x, y, angular_z, follow_linear_speed_, line_confidence);
+  RCLCPP_INFO(this->get_logger(), "Following %s -> X:%d, Y:%d, Ang_Z: %f, Lin_X: %f, Conf: %f", 
+              log_reason.c_str(), target_x, target_y, angular_z, follow_linear_speed_, line_confidence);
 }
 
 // 避障控制函数
