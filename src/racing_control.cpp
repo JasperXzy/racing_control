@@ -224,38 +224,32 @@ void RacingControlNode::MessageProcess(){
             ObstaclesAvoiding(relevant_obstacle_target);
         } 
         else {
-          // 正常巡线
-          if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
-              !current_line_msg->targets[0].points[0].point.empty() && !current_line_msg->targets[0].points[0].confidence.empty()) {
-              
-              float line_confidence = current_line_msg->targets[0].points[0].confidence[0];
-              if (line_confidence >= line_confidence_threshold_) {
-                // 高置信度，正常巡线
-                LineFollowing(current_line_msg->targets[0], line_confidence);
-              } else {
-                // 低置信度，重用上一个有效指令
-                if (has_valid_twist_) {
-                    RCLCPP_WARN(this->get_logger(), "Line confidence (%f) is low. Reusing last valid command.", line_confidence);
-                    publisher_->publish(last_valid_twist_);
-                } else {
-                    // 如果从未有过有效指令（例如启动初期），则慢速直行
-                    RCLCPP_WARN(this->get_logger(), "Line confidence low and no valid command history. Cruising straight.");
-                    twist_msg.linear.x = cruise_linear_speed_;
-                    twist_msg.angular.z = 0.0;
-                    publisher_->publish(twist_msg);
-                }
-              }
-          } else {
-              // 消息无效，同样重用上一个有效指令
-              if (has_valid_twist_) {
-                  RCLCPP_WARN(this->get_logger(), "Line message is invalid. Reusing last valid command.");
-                  publisher_->publish(last_valid_twist_);
-              } else {
-                  RCLCPP_WARN(this->get_logger(), "Line message invalid and no history. Cruising straight.");
-                  twist_msg.linear.x = cruise_linear_speed_;
-                  twist_msg.angular.z = 0.0;
-                  publisher_->publish(twist_msg);
-              }
+          // 正常巡线逻辑
+          float line_confidence = 0.0f;
+          // 安全地获取赛道线置信度
+          if (!current_line_msg->targets.empty() && 
+              !current_line_msg->targets[0].points.empty() && 
+              !current_line_msg->targets[0].points[0].confidence.empty()) {
+            line_confidence = current_line_msg->targets[0].points[0].confidence[0];
+          }
+
+          // 尝试执行巡线（函数内部会决策使用赛道线还是停车标志）
+          // 注意：即使 current_line_msg->targets 为空，我们依然传递一个空的 Target 对象，避免解引用空指针
+          const auto& line_target_to_pass = current_line_msg->targets.empty() ? ai_msgs::msg::Target() : current_line_msg->targets[0];
+          bool target_followed = LineFollowing(line_target_to_pass, line_confidence);
+
+          // 如果 LineFollowing 返回 false，说明它没找到任何可用的目标（无停车标志，且赛道线置信度低或无效）
+          if (!target_followed) {
+            // 在这里执行备用方案
+            if (has_valid_twist_) {
+                RCLCPP_WARN(this->get_logger(), "No valid target found. Reusing last valid command.");
+                publisher_->publish(last_valid_twist_);
+            } else {
+                RCLCPP_WARN(this->get_logger(), "No valid target and no history. Cruising straight.");
+                twist_msg.linear.x = cruise_linear_speed_;
+                twist_msg.angular.z = 0.0;
+                publisher_->publish(twist_msg);
+            }
           }
         }
         
@@ -272,51 +266,57 @@ void RacingControlNode::MessageProcess(){
 }
 
 // 巡线控制函数
-void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence){
+bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence){
   
   bool use_parking_sign = false;
   int target_x = 0;
   int target_y = 0;
-  std::string log_reason = "Line";
+  std::string log_reason;
+  bool target_found = false;
 
   // 1. 优先检查是否存在 "parking_sign"
   {
-    // 访问共享数据前加锁
     std::unique_lock<std::mutex> lock(point_target_mutex_);
     if (latest_targets_msg_ && !latest_targets_msg_->targets.empty()) {
       for (const auto& target : latest_targets_msg_->targets) {
-        // 找到了停车标志，并且它有有效的ROI
         if (target.type == "parking_sign" && !target.rois.empty()) {
-          // 使用停车标志的ROI中心点作为巡航目标
           target_x = target.rois[0].rect.x_offset + target.rois[0].rect.width / 2;
           target_y = target.rois[0].rect.y_offset + target.rois[0].rect.height / 2;
           use_parking_sign = true;
           log_reason = "Parking Sign";
-          // 找到一个就跳出循环，优先使用第一个检测到的
           break; 
         }
       }
     }
-  } // 互斥锁在此处自动释放
-
-  // 2. 如果没有找到停车标志，则使用常规的赛道线
-  if (!use_parking_sign) {
-    if (line_target.points.empty() || line_target.points[0].point.empty()) {
-      RCLCPP_WARN(this->get_logger(), "LineFollowing called with invalid line_target data.");
-      return; // 如果常规赛道线也无效，则直接返回
-    }
-    target_x = static_cast<int>(line_target.points[0].point[0].x);
-    target_y = static_cast<int>(line_target.points[0].point[0].y);
   }
 
-  // 3. 根据最终确定的目标点 (target_x, target_y) 计算并发布控制指令
+  // 2. 决策最终使用哪个目标
+  if (use_parking_sign) {
+    // 如果找到了停车标志，我们认为这是一个有效的目标
+    target_found = true;
+  } else if (line_confidence >= line_confidence_threshold_) {
+    // 如果没有停车标志，但赛道线置信度高，且数据有效
+    if (!line_target.points.empty() && !line_target.points[0].point.empty()) {
+        target_x = static_cast<int>(line_target.points[0].point[0].x);
+        target_y = static_cast<int>(line_target.points[0].point[0].y);
+        log_reason = "High-Conf Line";
+        target_found = true;
+    }
+  }
+
+  // 3. 如果最终没有找到任何有效目标，则返回 false
+  if (!target_found) {
+    // 这将告诉 MessageProcess 执行备用方案
+    return false;
+  }
+  
+  // 4. 如果找到了目标，则计算并发布控制指令
   float center_offset = static_cast<float>(target_x) - 320.0f;
   if (std::abs(center_offset) < 5.0f) { center_offset = 0.0f; }
   
   auto twist_msg = geometry_msgs::msg::Twist();
-  // 使用目标点的Y坐标来调整角速度响应的权重
   float target_y_relative = (static_cast<float>(target_y) - 256.0f) / (480.0f - 256.0f);
-  target_y_relative = std::max(0.0f, std::min(1.0f, target_y_relative)); // 归一化到 [0, 1]
+  target_y_relative = std::max(0.0f, std::min(1.0f, target_y_relative));
   
   float angular_z = follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
 
@@ -325,8 +325,6 @@ void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
 
   // 存储这个有效的指令
   last_valid_twist_ = twist_msg;
-  // 更新备用指令，当置信度低时使用
-  // 这里可以根据实际情况微调，比如转弯幅度可以设大一点确保能回到赛道
   last_valid_twist_.linear.x = cruise_linear_speed_; 
   last_valid_twist_.angular.z = std::copysign(10.0f, angular_z);
   has_valid_twist_ = true;
@@ -334,6 +332,9 @@ void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
   publisher_->publish(twist_msg);
   RCLCPP_INFO(this->get_logger(), "Following %s -> X:%d, Y:%d, Ang_Z: %f, Lin_X: %f, Conf: %f", 
               log_reason.c_str(), target_x, target_y, angular_z, follow_linear_speed_, line_confidence);
+
+  // 成功发布指令，返回 true
+  return true;
 }
 
 // 避障控制函数
