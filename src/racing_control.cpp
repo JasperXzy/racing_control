@@ -178,6 +178,8 @@ void RacingControlNode::MessageProcess(){
           // 持续检测到障碍物，执行避障
           ObstaclesAvoiding(relevant_obstacle_target);
         } else {
+          //结束避障，重置转弯方向last_avoidance_direction_为0
+          last_avoidance_direction_ = 0.0f;
           // 之前在避障，但现在视野中无障碍物，决策下一步
           RCLCPP_INFO(this->get_logger(), "Obstacle no longer detected. Deciding next state...");
           if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
@@ -272,7 +274,7 @@ void RacingControlNode::MessageProcess(){
 // 巡线控制函数
 void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence){
   if (line_target.points.empty() || line_target.points[0].point.empty()) { return; }
-  
+   
   int x = static_cast<int>(line_target.points[0].point[0].x);
   int y = static_cast<int>(line_target.points[0].point[0].y);
   float center_offset = static_cast<float>(x) - 320.0f;
@@ -288,6 +290,8 @@ void RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
 
   // 存储这个有效的指令
   last_valid_twist_ = twist_msg;
+  last_valid_twist_.linear.x = cruise_linear_speed_;
+  last_valid_twist_.angular.z = std::copysign(10.0f, angular_z);
   has_valid_twist_ = true;
 
   publisher_->publish(twist_msg);
@@ -317,6 +321,25 @@ void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
 
   // 记录这次避障的转向角速度，以备恢复赛道时使用
   last_avoidance_angular_z_ = angular_z_avoid;
+
+  //记录这次避障的方向
+  if(last_avoidance_direction_ == 0.0) //每次结束避障时更新last_avoidance_direction_ = 0 ，仅在第一次进行记录
+  {
+    if (angular_z_avoid > 0)
+    {
+      last_avoidance_direction_ = 1.0f;
+    }
+    else
+    {
+      last_avoidance_direction_ = -1.0f;
+    }
+  }
+
+  if( last_avoidance_direction_ * angular_z_avoid < 0 && last_avoidance_direction_ != 0) //避障状态机中出现于第一次记录方向相反，则用上一次状态
+  {
+    angular_z_avoid = 10.0f * last_avoidance_direction_;
+  }
+
 
   twist_msg.linear.x = avoid_linear_speed_;
   twist_msg.angular.z = angular_z_avoid;

@@ -83,6 +83,8 @@ private:
     // 状态机变量
     State current_state_ = State::LINE_FOLLOWING;
     float last_avoidance_angular_z_ = 0.0; // 记录最后一次避障的角速度
+ 
+    float last_avoidance_direction_ = 0.0; // 记录最后一次避障的方向(符号和last_avoidance_angular_z_相同，值取-1或1)
 
     geometry_msgs::msg::Twist last_valid_twist_;
     bool has_valid_twist_ = false; // 标志位，确保我们有一个可用的指令
