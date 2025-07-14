@@ -36,6 +36,8 @@ RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::
   this->get_parameter<float>("parking_sign_confidence_threshold", parking_sign_confidence_threshold_);
   this->declare_parameter<int>("bottom_threshold", bottom_threshold_);
   this->get_parameter<int>("bottom_threshold", bottom_threshold_);
+  this->declare_parameter<int>("parking_y_threshold", parking_y_threshold_);
+  this->get_parameter<int>("parking_y_threshold", parking_y_threshold_);
 
   // 特殊状态下的参数
   this->declare_parameter<float>("cruise_linear_speed", cruise_linear_speed_);
@@ -126,9 +128,13 @@ void RacingControlNode::MessageProcess(){
   rclcpp::Rate loop_rate(LOOP_RATE_HZ);
 
   while(process_stop_ == false){
-    // 检查节点是否被挂起
-    if (is_suspended_) {
-      // 如果被挂起，则不执行任何控制逻辑，仅循环等待
+    // 检查节点是否被挂起或已停车
+    if (is_suspended_ || current_state_ == State::PARKED) {
+      // 如果被挂起或已停车，则仅发布停止指令并等待
+      if (current_state_ == State::PARKED) {
+         auto stop_msg = geometry_msgs::msg::Twist(); // Ensure it stays stopped
+         publisher_->publish(stop_msg);
+      }
       loop_rate.sleep();
       continue;
     }
@@ -147,6 +153,29 @@ void RacingControlNode::MessageProcess(){
     auto twist_msg = geometry_msgs::msg::Twist();
     twist_msg.linear.x = 0.0;
     twist_msg.angular.z = 0.0;
+
+    bool parking_condition_met = false;
+    if (current_obstacle_msg && !current_obstacle_msg->targets.empty()) {
+        for (const auto &target : current_obstacle_msg->targets) {
+            if (target.type == "parking_sign" && !target.rois.empty() &&
+                target.rois[0].confidence >= parking_sign_confidence_threshold_) {
+                
+                int bottom_y = target.rois[0].rect.y_offset + target.rois[0].rect.height / 2;
+                if (bottom_y >= parking_y_threshold_) {
+                    RCLCPP_FATAL(this->get_logger(), "PARKING CONDITION MET! Sign bottom at Y=%d >= %d. Stopping now.", 
+                                 bottom_y, parking_y_threshold_);
+                    current_state_ = State::PARKED;
+                    parking_condition_met = true;
+                    break; // Exit the loop once parking condition is met
+                }
+            }
+        }
+    }
+    
+    if (parking_condition_met) {
+        publisher_->publish(twist_msg); // Publish final stop command
+        continue; // Skip all other logic for this cycle
+    }
 
     // 状态机决策
     bool obstacle_detected_and_close = false;
@@ -315,7 +344,7 @@ bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
   
   float angular_z = 0.0f;
   if (use_parking_sign) {
-    angular_z = 3.0f * follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
+    angular_z = 2.0f * follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
   } else {
     angular_z = follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
   }

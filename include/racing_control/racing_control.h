@@ -20,7 +20,8 @@ enum class State {
   LINE_FOLLOWING,       // 巡线模式
   OBSTACLE_AVOIDING,    // 避障模式
   RECOVERING_LINE,      // 避障后寻找赛道模式
-  STOP                  // 停止或等待
+  STOP,                 // 停止或等待
+  PARKED                // 已完成停车
 };
 
 // 比较函数，用于 priority_queue 以时间戳升序排序 (即最新消息在top)
@@ -75,12 +76,13 @@ private:
     float avoid_angular_ratio_ = 1.2;
     float obstacle_confidence_threshold_ = 0.8;
     int bottom_threshold_ = 320;
+    int parking_y_threshold_ = 300;
     
     // 低置信度巡航和寻找赛道时的参数
     float parking_sign_confidence_threshold_ = 0.3;
     float cruise_linear_speed_ = 0.2; // 低置信度时慢速直行的速度
-    float recovering_linear_speed_ = 0.2; // 寻找赛道时的线速度
-    float recovering_angular_ratio_ = 0.5; // 寻找赛道时的角速度比例
+    float recovering_linear_speed_ = 0.7; // 寻找赛道时的线速度
+    float recovering_angular_ratio_ = 0.8; // 寻找赛道时的角速度比例
 
     // 状态机变量
     State current_state_ = State::LINE_FOLLOWING;
