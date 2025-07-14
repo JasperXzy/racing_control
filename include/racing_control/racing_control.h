@@ -58,6 +58,7 @@ private:
     bool LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence);
     void ObstaclesAvoiding(const ai_msgs::msg::Target &obstacle_target);
     void MessageProcess(void);
+    bool hasVisiblePrimaryTarget();
     
     std::string pub_control_topic_ = "cmd_vel";
     std::mutex point_target_mutex_;

@@ -180,38 +180,34 @@ void RacingControlNode::MessageProcess(){
           // 持续检测到障碍物，执行避障
           ObstaclesAvoiding(relevant_obstacle_target);
         } else {
-          //结束避障，重置转弯方向last_avoidance_direction_为0
+          // 结束避障，重置转弯方向
           last_avoidance_direction_ = 0.0f;
-          // 之前在避障，但现在视野中无障碍物，决策下一步
           RCLCPP_INFO(this->get_logger(), "Obstacle no longer detected. Deciding next state...");
-          if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
-            !current_line_msg->targets[0].points[0].confidence.empty() && 
-            current_line_msg->targets[0].points[0].confidence[0] >= line_confidence_threshold_) {
-              // 看到了清晰的赛道线，切回巡线
+
+          // 优化点 1: 检查是否存在任何主要目标（线或停车标志）
+          if (hasVisiblePrimaryTarget()) {
+              // 看到了清晰的赛道线或停车标志，切回巡线模式
               current_state_ = State::LINE_FOLLOWING;
-              RCLCPP_INFO(this->get_logger(), "High confidence line found! Switching to LINE_FOLLOWING.");
-            } else {
-              // 没看到赛道线，进入寻找赛道状态
+              RCLCPP_INFO(this->get_logger(), "Primary target (Line or Sign) found! Switching to LINE_FOLLOWING.");
+          } else {
+              // 两个都没看到，进入寻找赛道状态
               current_state_ = State::RECOVERING_LINE;
-              RCLCPP_INFO(this->get_logger(), "No clear line. Switching to RECOVERING_LINE.");
-            }
+              RCLCPP_INFO(this->get_logger(), "No clear target. Switching to RECOVERING_LINE.");
+          }
         }
         break;
 
       case State::RECOVERING_LINE:
-        RCLCPP_INFO(this->get_logger(), "In RECOVERING_LINE state, trying to find the track.");
-        // 检查是否已找到高置信度的赛道线
-        if (!current_line_msg->targets.empty() && !current_line_msg->targets[0].points.empty() &&
-            !current_line_msg->targets[0].points[0].confidence.empty() && 
-            current_line_msg->targets[0].points[0].confidence[0] >= line_confidence_threshold_) {
-          // 切换回巡线状态
+        RCLCPP_INFO(this->get_logger(), "In RECOVERING_LINE state, trying to find a target.");
+        
+        // 优化点 2: 检查是否已找到任何主要目标（线或停车标志）
+        if (hasVisiblePrimaryTarget()) {
+          // 找到了，切换回巡线状态
           current_state_ = State::LINE_FOLLOWING;
-          RCLCPP_INFO(this->get_logger(), "High confidence line found! Switching back to LINE_FOLLOWING.");
+          RCLCPP_INFO(this->get_logger(), "Primary target (Line or Sign) found! Switching back to LINE_FOLLOWING.");
         } else {
           // 未找到，执行“反向转弯”寻找赛道
           twist_msg.linear.x = recovering_linear_speed_;
-          // last_avoidance_angular_z_ < 0 表示向左转避障，现在需要向右转(>0)寻找
-          // last_avoidance_angular_z_ > 0 表示向右转避障，现在需要向左转(<0)寻找
           twist_msg.angular.z = -1.0 * std::copysign(recovering_angular_ratio_, last_avoidance_angular_z_);
           RCLCPP_INFO(this->get_logger(), "Recovering with Ang_Z: %f", twist_msg.angular.z);
           publisher_->publish(twist_msg);
@@ -220,29 +216,24 @@ void RacingControlNode::MessageProcess(){
 
       case State::LINE_FOLLOWING:
         // 在巡线状态，也要检查障碍物，因为障碍物可能突然出现
-        if (obstacle_detected_and_close) { // 如果在巡线时发现障碍物，立即切换
+        if (obstacle_detected_and_close) {
             current_state_ = State::OBSTACLE_AVOIDING;
             has_valid_twist_ = false; // 进入避障时，旧的巡线指令失效
             ObstaclesAvoiding(relevant_obstacle_target);
         } 
         else {
-          // 正常巡线逻辑
+          // 正常巡线逻辑 (这部分逻辑保持不变, 它已经很健壮了)
           float line_confidence = 0.0f;
-          // 安全地获取赛道线置信度
           if (!current_line_msg->targets.empty() && 
               !current_line_msg->targets[0].points.empty() && 
               !current_line_msg->targets[0].points[0].confidence.empty()) {
             line_confidence = current_line_msg->targets[0].points[0].confidence[0];
           }
 
-          // 尝试执行巡线（函数内部会决策使用赛道线还是停车标志）
-          // 注意：即使 current_line_msg->targets 为空，我们依然传递一个空的 Target 对象，避免解引用空指针
           const auto& line_target_to_pass = current_line_msg->targets.empty() ? ai_msgs::msg::Target() : current_line_msg->targets[0];
           bool target_followed = LineFollowing(line_target_to_pass, line_confidence);
 
-          // 如果 LineFollowing 返回 false，说明它没找到任何可用的目标（无停车标志，且赛道线置信度低或无效）
           if (!target_followed) {
-            // 在这里执行备用方案
             if (has_valid_twist_) {
                 RCLCPP_WARN(this->get_logger(), "No valid target found. Reusing last valid command.");
                 publisher_->publish(last_valid_twist_);
@@ -254,7 +245,6 @@ void RacingControlNode::MessageProcess(){
             }
           }
         }
-        
         break;
       
       default: // 包括 STOP 状态
@@ -396,6 +386,32 @@ void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
   publisher_->publish(twist_msg);
   RCLCPP_INFO(this->get_logger(), "Obstacles Avoiding -> CenterX:%d, Ang_Z: %f, Lin_X: %f", center_x, angular_z_avoid, avoid_linear_speed_);
 }
+
+bool RacingControlNode::hasVisiblePrimaryTarget() {
+    std::unique_lock<std::mutex> lock(point_target_mutex_);
+
+    // 1. Check for a high-confidence track line
+    if (latest_point_msg_ && !latest_point_msg_->targets.empty() && 
+        !latest_point_msg_->targets[0].points.empty() && 
+        !latest_point_msg_->targets[0].points[0].confidence.empty() &&
+        latest_point_msg_->targets[0].points[0].confidence[0] >= line_confidence_threshold_) {
+        return true; // Found a valid line
+    }
+
+    // 2. If no line, check for a high-confidence parking sign
+    if (latest_targets_msg_ && !latest_targets_msg_->targets.empty()) {
+        for (const auto& target : latest_targets_msg_->targets) {
+            if (target.type == "parking_sign" && !target.rois.empty() &&
+                target.rois[0].confidence >= parking_sign_confidence_threshold_) {
+                return true; // Found a valid parking sign
+            }
+        }
+    }
+
+    // 3. If neither is found
+    return false;
+}
+
 
 // 主函数
 int main(int argc, char* argv[]) {
