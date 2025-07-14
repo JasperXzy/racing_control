@@ -32,6 +32,8 @@ RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::
   this->get_parameter<float>("avoid_angular_ratio", avoid_angular_ratio_);
   this->declare_parameter<float>("obstacle_confidence_threshold", obstacle_confidence_threshold_);
   this->get_parameter<float>("obstacle_confidence_threshold", obstacle_confidence_threshold_);
+  this->declare_parameter<float>("parking_sign_confidence_threshold", parking_sign_confidence_threshold_);
+  this->get_parameter<float>("parking_sign_confidence_threshold", parking_sign_confidence_threshold_);
   this->declare_parameter<int>("bottom_threshold", bottom_threshold_);
   this->get_parameter<int>("bottom_threshold", bottom_threshold_);
 
@@ -274,16 +276,19 @@ bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
   std::string log_reason;
   bool target_found = false;
 
-  // 1. 优先检查是否存在 "parking_sign"
+  // 1. 优先检查是否存在高置信度的 "parking_sign"
   {
     std::unique_lock<std::mutex> lock(point_target_mutex_);
     if (latest_targets_msg_ && !latest_targets_msg_->targets.empty()) {
       for (const auto& target : latest_targets_msg_->targets) {
-        if (target.type == "parking_sign" && !target.rois.empty()) {
+        // 条件判断：类型是 parking_sign，有 ROI，且置信度大于等于阈值
+        if (target.type == "parking_sign" && !target.rois.empty() && 
+            target.rois[0].confidence >= parking_sign_confidence_threshold_) {
+          
           target_x = target.rois[0].rect.x_offset + target.rois[0].rect.width / 2;
           target_y = target.rois[0].rect.y_offset + target.rois[0].rect.height / 2;
           use_parking_sign = true;
-          log_reason = "Parking Sign";
+          log_reason = "High-Conf Parking Sign"; // 更新日志信息，更明确
           break; 
         }
       }
@@ -292,7 +297,7 @@ bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
 
   // 2. 决策最终使用哪个目标
   if (use_parking_sign) {
-    // 如果找到了停车标志，我们认为这是一个有效的目标
+    // 如果找到了高置信度的停车标志，我们认为这是一个有效的目标
     target_found = true;
   } else if (line_confidence >= line_confidence_threshold_) {
     // 如果没有停车标志，但赛道线置信度高，且数据有效
@@ -318,7 +323,12 @@ bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
   float target_y_relative = (static_cast<float>(target_y) - 256.0f) / (480.0f - 256.0f);
   target_y_relative = std::max(0.0f, std::min(1.0f, target_y_relative));
   
-  float angular_z = follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
+  float angular_z = 0.0f;
+  if (use_parking_sign) {
+    angular_z = 3.0f * follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
+  } else {
+    angular_z = follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
+  }
 
   twist_msg.linear.x = follow_linear_speed_;
   twist_msg.angular.z = angular_z;
@@ -330,8 +340,9 @@ bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
   has_valid_twist_ = true;
 
   publisher_->publish(twist_msg);
-  RCLCPP_INFO(this->get_logger(), "Following %s -> X:%d, Y:%d, Ang_Z: %f, Lin_X: %f, Conf: %f", 
-              log_reason.c_str(), target_x, target_y, angular_z, follow_linear_speed_, line_confidence);
+  float sign_conf = use_parking_sign ? latest_targets_msg_->targets[0].rois[0].confidence : 0.0f;
+  RCLCPP_INFO(this->get_logger(), "Following %s -> X:%d, Y:%d, Ang_Z: %f, Lin_X: %f (LineConf: %.2f, SignConf: %.2f)", 
+              log_reason.c_str(), target_x, target_y, angular_z, follow_linear_speed_, line_confidence, sign_conf);
 
   // 成功发布指令，返回 true
   return true;

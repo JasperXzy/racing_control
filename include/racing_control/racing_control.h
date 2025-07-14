@@ -76,6 +76,7 @@ private:
     int bottom_threshold_ = 320;
     
     // 低置信度巡航和寻找赛道时的参数
+    float parking_sign_confidence_threshold_ = 0.3;
     float cruise_linear_speed_ = 0.2; // 低置信度时慢速直行的速度
     float recovering_linear_speed_ = 0.2; // 寻找赛道时的线速度
     float recovering_angular_ratio_ = 0.5; // 寻找赛道时的角速度比例
