@@ -57,7 +57,9 @@ private:
     // 处理/sign4return消息的回调函数
     void sign_callback(const std_msgs::msg::Int32::SharedPtr msg);
     bool LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence);
-    void ObstaclesAvoiding(const ai_msgs::msg::Target &obstacle_target);
+    void ObstaclesAvoiding(const ai_msgs::msg::Target &obstacle_target,
+                           const ai_msgs::msg::PerceptionTargets::SharedPtr line_msg,
+                           const ai_msgs::msg::PerceptionTargets::SharedPtr all_obstacles_msg);
     void MessageProcess(void);
     bool hasVisiblePrimaryTarget();
     

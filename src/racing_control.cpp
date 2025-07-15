@@ -207,7 +207,7 @@ void RacingControlNode::MessageProcess(){
       case State::OBSTACLE_AVOIDING:
         if (obstacle_detected_and_close) {
           // 持续检测到障碍物，执行避障
-          ObstaclesAvoiding(relevant_obstacle_target);
+          ObstaclesAvoiding(relevant_obstacle_target, current_line_msg, current_obstacle_msg);
         } else {
           // 结束避障，重置转弯方向
           last_avoidance_direction_ = 0.0f;
@@ -248,7 +248,7 @@ void RacingControlNode::MessageProcess(){
         if (obstacle_detected_and_close) {
             current_state_ = State::OBSTACLE_AVOIDING;
             has_valid_twist_ = false; // 进入避障时，旧的巡线指令失效
-            ObstaclesAvoiding(relevant_obstacle_target);
+            ObstaclesAvoiding(relevant_obstacle_target, current_line_msg, current_obstacle_msg);
         } 
         else {
           // 正常巡线逻辑 (这部分逻辑保持不变, 它已经很健壮了)
@@ -368,52 +368,76 @@ bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
 }
 
 // 避障控制函数
-void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
+void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target,
+                                          const ai_msgs::msg::PerceptionTargets::SharedPtr line_msg,
+                                          const ai_msgs::msg::PerceptionTargets::SharedPtr all_obstacles_msg) {
   if (target.rois.empty() || target.rois[0].rect.width == 0) {
       RCLCPP_ERROR(this->get_logger(), "CRITICAL: ObstaclesAvoiding called with invalid ROI data!");
       return; 
   }
 
+  // --- NEW LOGIC: Determine the dynamic reference point ---
+  int reference_x = 320; // Default reference is the image center
+  std::string reference_source = "Image Center";
+  bool primary_target_found = false;
+
+  // 1. Prioritize a valid parking sign ("终点")
+  if (all_obstacles_msg && !all_obstacles_msg->targets.empty()) {
+      for (const auto& other_target : all_obstacles_msg->targets) {
+          if (other_target.type == "parking_sign" && !other_target.rois.empty() &&
+              other_target.rois[0].confidence >= parking_sign_confidence_threshold_) {
+              
+              reference_x = other_target.rois[0].rect.x_offset + other_target.rois[0].rect.width / 2;
+              reference_source = "Parking Sign";
+              primary_target_found = true; // Mark that we found our highest-priority target
+              break; // Found a valid sign, use it and stop searching
+          }
+      }
+  }
+
+  // 2. If no sign was found, check for a valid track line
+  if (!primary_target_found && line_msg && !line_msg->targets.empty() && 
+      !line_msg->targets[0].points.empty() && 
+      !line_msg->targets[0].points[0].confidence.empty() &&
+      line_msg->targets[0].points[0].confidence[0] >= line_confidence_threshold_) {
+      
+      reference_x = static_cast<int>(line_msg->targets[0].points[0].point[0].x);
+      reference_source = "Track Line";
+      // No need to set the flag here, as this is the last check in the priority chain.
+  }
+  // --- END OF NEW LOGIC ---
+
   auto twist_msg = geometry_msgs::msg::Twist();
   int center_x = target.rois[0].rect.x_offset + target.rois[0].rect.width / 2;
-  float obstacle_center_offset = static_cast<float>(center_x) - 320.0f; 
+  
+  // The key change: calculate offset from the dynamic reference point
+  float obstacle_center_offset = static_cast<float>(center_x) - static_cast<float>(reference_x); 
 
   float angular_z_avoid = 0.0f;
 
-  if(obstacle_center_offset < 5.0f && obstacle_center_offset >= 0) {
-    obstacle_center_offset = 5.0f;
-  } else if(obstacle_center_offset > -5.0f && obstacle_center_offset < 0) {
-    obstacle_center_offset = -5.0f;
+  if(std::abs(obstacle_center_offset) < 5.0f) {
+      obstacle_center_offset = std::copysign(5.0f, obstacle_center_offset);
   }
 
   angular_z_avoid = -1.0f * avoid_angular_ratio_ * std::min(4.0f, (320.0f / obstacle_center_offset));
 
-  // 记录这次避障的转向角速度，以备恢复赛道时使用
   last_avoidance_angular_z_ = angular_z_avoid;
 
-  //记录这次避障的方向
-  if(last_avoidance_direction_ == 0.0) //每次结束避障时更新last_avoidance_direction_ = 0 ，仅在第一次进行记录
-  {
-    if (angular_z_avoid > 0)
-    {
-      last_avoidance_direction_ = 1.0f;
-    }
-    else
-    {
-      last_avoidance_direction_ = -1.0f;
-    }
+  if(last_avoidance_direction_ == 0.0) {
+    last_avoidance_direction_ = std::copysign(1.0f, angular_z_avoid);
   }
 
-  if( last_avoidance_direction_ * angular_z_avoid < 0 && last_avoidance_direction_ != 0) //避障状态机中出现于第一次记录方向相反，则用上一次状态
-  {
+  if(last_avoidance_direction_ * angular_z_avoid < 0) {
     angular_z_avoid = 10.0f * last_avoidance_direction_;
   }
-
 
   twist_msg.linear.x = avoid_linear_speed_;
   twist_msg.angular.z = angular_z_avoid;
   publisher_->publish(twist_msg);
-  RCLCPP_INFO(this->get_logger(), "Obstacles Avoiding -> CenterX:%d, Ang_Z: %f, Lin_X: %f", center_x, angular_z_avoid, avoid_linear_speed_);
+
+  // Updated log message for better debugging
+  RCLCPP_INFO(this->get_logger(), "Obstacles Avoiding -> ObstacleX:%d, RefX:%d (%s), Offset:%.1f, Ang_Z: %f, Lin_X: %f", 
+              center_x, reference_x, reference_source.c_str(), obstacle_center_offset, angular_z_avoid, avoid_linear_speed_);
 }
 
 bool RacingControlNode::hasVisiblePrimaryTarget() {
