@@ -36,9 +36,13 @@ def generate_launch_description():
             default_value='0.1',
             description='linear speed for line following'),
         DeclareLaunchArgument(
-            'bottom_threshold',
-            default_value='200',
-            description='bottom threshold for line following'),
+            'bottom_threshold_caution',
+            default_value='280',
+            description='bottom_threshold_caution for line following'),
+        DeclareLaunchArgument(
+            'bottom_threshold_avoid',
+            default_value='320',
+            description='bottom_threshold_avoid for line following'),
         DeclareLaunchArgument(
             'parking_y_threshold',
             description='Y-pixel threshold for parking sign bottom edge to trigger stop'),
@@ -66,7 +70,8 @@ def generate_launch_description():
                 {"recovering_angular_ratio": LaunchConfiguration('recovering_angular_ratio')},
                 {"follow_angular_ratio": LaunchConfiguration('follow_angular_ratio')},
                 {"follow_linear_speed": LaunchConfiguration('follow_linear_speed')},
-                {"bottom_threshold": LaunchConfiguration('bottom_threshold')},
+                {"bottom_threshold_caution": LaunchConfiguration('bottom_threshold_caution')},
+                {"bottom_threshold_avoid": LaunchConfiguration('bottom_threshold_avoid')},
                 {"parking_y_threshold": LaunchConfiguration('parking_y_threshold')},
                 {"line_confidence_threshold": LaunchConfiguration('line_confidence_threshold')},
                 {"obstacle_confidence_threshold": LaunchConfiguration('obstacle_confidence_threshold')},

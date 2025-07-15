@@ -34,8 +34,10 @@ RacingControlNode::RacingControlNode(const std::string& node_name,const rclcpp::
   this->get_parameter<float>("obstacle_confidence_threshold", obstacle_confidence_threshold_);
   this->declare_parameter<float>("parking_sign_confidence_threshold", parking_sign_confidence_threshold_);
   this->get_parameter<float>("parking_sign_confidence_threshold", parking_sign_confidence_threshold_);
-  this->declare_parameter<int>("bottom_threshold", bottom_threshold_);
-  this->get_parameter<int>("bottom_threshold", bottom_threshold_);
+  this->declare_parameter<int>("bottom_threshold_caution", bottom_threshold_caution_);
+  this->get_parameter<int>("bottom_threshold_caution", bottom_threshold_caution_);
+  this->declare_parameter<int>("bottom_threshold_avoid", bottom_threshold_avoid_);
+  this->get_parameter<int>("bottom_threshold_avoid", bottom_threshold_avoid_);
   this->declare_parameter<int>("parking_y_threshold", parking_y_threshold_);
   this->get_parameter<int>("parking_y_threshold", parking_y_threshold_);
 
@@ -181,18 +183,19 @@ void RacingControlNode::MessageProcess(){
     bool obstacle_detected_and_close = false;
     ai_msgs::msg::Target relevant_obstacle_target;
 
-    // 1. 检查障碍物，这具有最高优先级
+    // 1. 检查障碍物是否近到需要【避障】 (使用 avoid 阈值)
     if (current_obstacle_msg && !current_obstacle_msg->targets.empty()) {
         for(const auto &target : current_obstacle_msg->targets){
             if(target.type == "construction_cone" && !target.rois.empty()){
                 float obstacle_conf = target.rois[0].confidence;
                 int bottom = target.rois[0].rect.y_offset + target.rois[0].rect.height;
-                if (obstacle_conf >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_) {
+                // Only trigger avoidance if the obstacle is past the AVOID threshold
+                if (obstacle_conf >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_avoid_) {
                     obstacle_detected_and_close = true;
                     relevant_obstacle_target = target;
-                    // 如果当前不是避障状态，则切换进去
                     if (current_state_ != State::OBSTACLE_AVOIDING) {
-                        RCLCPP_INFO(this->get_logger(), "Close obstacle detected! Switching to OBSTACLE_AVOIDING.");
+                        RCLCPP_INFO(this->get_logger(), "Obstacle past avoid_threshold (%d >= %d)! Switching to OBSTACLE_AVOIDING.",
+                                    bottom, bottom_threshold_avoid_);
                         current_state_ = State::OBSTACLE_AVOIDING;
                     }
                     break;
@@ -251,7 +254,26 @@ void RacingControlNode::MessageProcess(){
             ObstaclesAvoiding(relevant_obstacle_target, current_line_msg, current_obstacle_msg);
         } 
         else {
-          // 正常巡线逻辑 (这部分逻辑保持不变, 它已经很健壮了)
+          // 正常巡线，但需要检查是否进入了“谨慎区域”
+          float target_linear_speed = follow_linear_speed_; // Start with default speed
+
+          // Check if any obstacle is in the caution zone (between caution and avoid thresholds)
+          if (current_obstacle_msg && !current_obstacle_msg->targets.empty()) {
+              for (const auto &target : current_obstacle_msg->targets) {
+                  if(target.type == "construction_cone" && !target.rois.empty()){
+                      int bottom = target.rois[0].rect.y_offset + target.rois[0].rect.height;
+                      if (target.rois[0].confidence >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_caution_) {
+                          // Obstacle is close enough to be cautious, so slow down.
+                          target_linear_speed = avoid_linear_speed_;
+                          RCLCPP_INFO(this->get_logger(), "Obstacle in caution zone (%d >= %d). Slowing down to %.2f m/s.",
+                                      bottom, bottom_threshold_caution_, target_linear_speed);
+                          break; // Found one obstacle in caution, no need to check others
+                      }
+                  }
+              }
+          }
+
+          // 获取赛道线信息
           float line_confidence = 0.0f;
           if (!current_line_msg->targets.empty() && 
               !current_line_msg->targets[0].points.empty() && 
@@ -260,7 +282,9 @@ void RacingControlNode::MessageProcess(){
           }
 
           const auto& line_target_to_pass = current_line_msg->targets.empty() ? ai_msgs::msg::Target() : current_line_msg->targets[0];
-          bool target_followed = LineFollowing(line_target_to_pass, line_confidence);
+          
+          // 调用巡线函数，并传入最终决定的速度
+          bool target_followed = LineFollowing(line_target_to_pass, line_confidence, target_linear_speed);
 
           if (!target_followed) {
             if (has_valid_twist_) {
@@ -287,7 +311,7 @@ void RacingControlNode::MessageProcess(){
 }
 
 // 巡线控制函数
-bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence){
+bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence, float target_linear_speed){
   
   bool use_parking_sign = false;
   int target_x = 0;
@@ -303,11 +327,11 @@ bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
         // 条件判断：类型是 parking_sign，有 ROI，且置信度大于等于阈值
         if (target.type == "parking_sign" && !target.rois.empty() && 
             target.rois[0].confidence >= parking_sign_confidence_threshold_) {
-          
+
           target_x = target.rois[0].rect.x_offset + target.rois[0].rect.width / 2;
           target_y = target.rois[0].rect.y_offset + target.rois[0].rect.height / 2;
           use_parking_sign = true;
-          log_reason = "High-Conf Parking Sign"; // 更新日志信息，更明确
+          log_reason = "High-Conf Parking Sign";
           break; 
         }
       }
@@ -349,10 +373,10 @@ bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
     angular_z = follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
   }
 
-  twist_msg.linear.x = follow_linear_speed_;
+  // Use the speed passed into the function
+  twist_msg.linear.x = target_linear_speed; // <-- This is the main change here
   twist_msg.angular.z = angular_z;
 
-  // 存储这个有效的指令
   last_valid_twist_ = twist_msg;
   last_valid_twist_.linear.x = cruise_linear_speed_; 
   last_valid_twist_.angular.z = std::copysign(10.0f, angular_z);
@@ -360,10 +384,11 @@ bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, f
 
   publisher_->publish(twist_msg);
   float sign_conf = use_parking_sign ? latest_targets_msg_->targets[0].rois[0].confidence : 0.0f;
-  RCLCPP_INFO(this->get_logger(), "Following %s -> X:%d, Y:%d, Ang_Z: %f, Lin_X: %f (LineConf: %.2f, SignConf: %.2f)", 
-              log_reason.c_str(), target_x, target_y, angular_z, follow_linear_speed_, line_confidence, sign_conf);
+  
+  // Update the log to show the actual linear speed being used
+  RCLCPP_INFO(this->get_logger(), "Following %s -> X:%d, Y:%d, Ang_Z: %.2f, Lin_X: %.2f (LineConf: %.2f, SignConf: %.2f)", 
+              log_reason.c_str(), target_x, target_y, angular_z, target_linear_speed, line_confidence, sign_conf);
 
-  // 成功发布指令，返回 true
   return true;
 }
 
