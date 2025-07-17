@@ -30,10 +30,6 @@ enum class State {
 struct compare_timestamps {
   bool operator()(const ai_msgs::msg::PerceptionTargets::SharedPtr m1,
                   const ai_msgs::msg::PerceptionTargets::SharedPtr m2) const {
-    // Return true if m1 is "less" than m2, meaning m1 has an older timestamp.
-    // So, m2 (newer) will be considered "greater" and thus pushed to the top (max heap behavior).
-    // This is typically the default behavior if you just push: newest will be at the bottom.
-    // If you want newset on top for easy access:
     return (m1->header.stamp.sec < m2->header.stamp.sec) ||
            ((m1->header.stamp.sec == m2->header.stamp.sec) &&
             (m1->header.stamp.nanosec < m2->header.stamp.nanosec));
@@ -48,13 +44,13 @@ public:
 private:
     rclcpp::Subscription<ai_msgs::msg::PerceptionTargets>::SharedPtr point_subscriber_;
     rclcpp::Subscription<ai_msgs::msg::PerceptionTargets>::SharedPtr target_subscriber_;
-    // 订阅/sign4return话题的订阅器
+    // 订阅 /sign4return 话题的订阅器
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr sign_subscriber_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr publisher_;
 
     void subscription_callback_point(const ai_msgs::msg::PerceptionTargets::SharedPtr point_msg);
     void subscription_callback_target(const ai_msgs::msg::PerceptionTargets::SharedPtr targets_msg);
-    // 处理/sign4return消息的回调函数
+    // 处理 /sign4return 消息的回调函数
     void sign_callback(const std_msgs::msg::Int32::SharedPtr msg);
     bool LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence, float target_linear_speed);
     void ObstaclesAvoiding(const ai_msgs::msg::Target &obstacle_target);
@@ -81,18 +77,18 @@ private:
     
     // 低置信度巡航和寻找赛道时的参数
     float parking_sign_confidence_threshold_ = 0.3;
-    float cruise_linear_speed_ = 0.2; // 低置信度时慢速直行的速度
-    float recovering_linear_speed_ = 0.7; // 寻找赛道时的线速度
-    float recovering_angular_ratio_ = 0.8; // 寻找赛道时的角速度比例
+    float cruise_linear_speed_ = 0.2;       // 低置信度时慢速直行的速度
+    float recovering_linear_speed_ = 0.7;   // 寻找赛道时的线速度
+    float recovering_angular_ratio_ = 0.8;  // 寻找赛道时的角速度比例
 
     // 状态机变量
     State current_state_ = State::LINE_FOLLOWING;
-    float last_avoidance_angular_z_ = 0.0; // 记录最后一次避障的角速度
+    float last_avoidance_angular_z_ = 0.0;  // 记录最后一次避障的角速度
  
-    float last_avoidance_direction_ = 0.0; // 记录最后一次避障的方向(符号和last_avoidance_angular_z_相同，值取-1或1)
+    float last_avoidance_direction_ = 0.0;  // 记录最后一次避障的方向(符号和last_avoidance_angular_z_相同，值取-1或1)
 
     geometry_msgs::msg::Twist last_valid_twist_;
-    bool has_valid_twist_ = false; // 标志位，确保我们有一个可用的指令
+    bool has_valid_twist_ = false;          // 标志位，确保我们有一个可用的指令
 
     // 最新消息存储
     ai_msgs::msg::PerceptionTargets::SharedPtr latest_point_msg_;
