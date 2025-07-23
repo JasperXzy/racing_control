@@ -166,7 +166,16 @@ void RacingControlNode::MessageProcess(){
     bool has_primary_target = hasValidTrackLine(current_line_msg) || findFollowableParkingSign(current_obstacle_msg).has_value();
 
     // --- 状态转换逻辑 ---
-    if (obstacle_to_avoid && current_state_ != State::OBSTACLE_AVOIDING) {
+    bool should_force_avoidance = obstacle_to_avoid.has_value();
+    if (current_state_ == State::RECOVERING_LINE && obstacle_to_avoid) {
+        // 如果当前正在回线，只有当新障碍物出现在回线同侧时，才需要再次进入避障
+        if (!isObstacleOnRecoverySide(*obstacle_to_avoid)) {
+            RCLCPP_INFO(this->get_logger(), "回线时发现异侧障碍物，忽略，继续回线。");
+            should_force_avoidance = false; // 覆盖决定，不强制避障
+        }
+    }
+
+    if (should_force_avoidance && current_state_ != State::OBSTACLE_AVOIDING) {
         RCLCPP_INFO(this->get_logger(), "障碍物过近！强制切换到避障模式。");
         current_state_ = State::OBSTACLE_AVOIDING;
         has_valid_twist_ = false; // 旧指令失效
@@ -206,7 +215,24 @@ void RacingControlNode::MessageProcess(){
         } else {
           // 检查是否存在障碍物且 bottom >= bottom_threshold_caution_
           auto twist_msg = geometry_msgs::msg::Twist();
-          twist_msg.linear.x = isObstacleInCautionZone(current_obstacle_msg) ? avoid_linear_speed_ : recovering_linear_speed_;
+          bool slow_down_for_obstacle = false;
+          // 我们需要检查是否有障碍物进入了谨慎区域
+          if (current_obstacle_msg && !current_obstacle_msg->targets.empty()) {
+              for (const auto& target : current_obstacle_msg->targets) {
+                  if (target.type == "construction_cone" && !target.rois.empty()) {
+                      int bottom = target.rois[0].rect.y_offset + target.rois[0].rect.height;
+                      if (target.rois[0].confidence >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_caution_) {
+                          // 发现一个谨慎区障碍物，现在检查它是否在回线同侧
+                          if (isObstacleOnRecoverySide(target)) {
+                              slow_down_for_obstacle = true;
+                              RCLCPP_WARN(this->get_logger(), "回线时，同侧发现谨慎区障碍物，减速！");
+                              break; // 找到一个就够了
+                          }
+                      }
+                  }
+              }
+          }
+          twist_msg.linear.x = slow_down_for_obstacle ? avoid_linear_speed_ : recovering_linear_speed_;
           twist_msg.angular.z = -1.0 * std::copysign(recovering_angular_ratio_, last_avoidance_angular_z_);
           RCLCPP_INFO(this->get_logger(), "Recovering with linear speed: %.2f, angular z: %f", twist_msg.linear.x, twist_msg.angular.z);
           publisher_->publish(twist_msg);
@@ -226,7 +252,7 @@ void RacingControlNode::MessageProcess(){
                 publisher_->publish(last_valid_twist_);
             } else {
                 // 如果没有任何历史指令，则执行低速直行
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "LineFollowing failed. No valid target. Executing fallback.");w
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "LineFollowing failed. No valid target. Executing fallback.");
                 auto cruise_msg = geometry_msgs::msg::Twist();
                 cruise_msg.linear.x = cruise_linear_speed_;
                 publisher_->publish(cruise_msg);
@@ -236,7 +262,7 @@ void RacingControlNode::MessageProcess(){
         break;
       
       default: // 包括 STOP 状态
-        publisher_->publish(twist_msg); // 发布停止指令
+        publisher_->publish(geometry_msgs::msg::Twist()); // 发布停止指令
         break;
     }
 
@@ -409,6 +435,34 @@ bool RacingControlNode::isObstacleInCautionZone(const ai_msgs::msg::PerceptionTa
             }
         }
     }
+    return false;
+}
+
+// 检查障碍物是否在回线方向的同侧
+bool RacingControlNode::isObstacleOnRecoverySide(const ai_msgs::msg::Target& obstacle) const {
+    if (last_avoidance_angular_z_ == 0.0f || obstacle.rois.empty()) {
+        // 如果没有记录避障方向，或者障碍物信息无效，默认认为不在同侧（安全起见，不触发特殊逻辑）
+        return false;
+    }
+
+    int obstacle_center_x = obstacle.rois[0].rect.x_offset + obstacle.rois[0].rect.width / 2;
+    const int screen_center_x = 320;
+
+    // last_avoidance_angular_z_ < 0 表示上次向左转避障，现在需要向右回线
+    // 此时我们只关心右侧 (x > 320) 的新障碍物
+    bool recovering_right = last_avoidance_angular_z_ > 0;
+    if (recovering_right && obstacle_center_x > screen_center_x) {
+        return true;
+    }
+
+    // last_avoidance_angular_z_ > 0 表示上次向右转避障，现在需要向左回线
+    // 此时我们只关心左侧 (x < 320) 的新障碍物
+    bool recovering_left = last_avoidance_angular_z_ < 0;
+    if (recovering_left && obstacle_center_x < screen_center_x) {
+        return true;
+    }
+
+    // 其他情况（如向右回线时，障碍物在左边）都返回 false
     return false;
 }
 
