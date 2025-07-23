@@ -315,7 +315,7 @@ bool RacingControlNode::LineFollowing(float target_linear_speed){
   
   last_valid_twist_ = twist_msg;
   last_valid_twist_.linear.x = target_linear_speed; 
-  last_valid_twist_.angular.z = twist_msg.angular.z;
+  last_valid_twist_.angular.z = 3 * twist_msg.angular.z;
   has_valid_twist_ = true;
 
   publisher_->publish(twist_msg);
