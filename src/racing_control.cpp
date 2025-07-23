@@ -152,77 +152,51 @@ void RacingControlNode::MessageProcess(){
         continue;
     }
 
-    auto twist_msg = geometry_msgs::msg::Twist();
-    twist_msg.linear.x = 0.0;
-    twist_msg.angular.z = 0.0;
-
-    bool parking_condition_met = false;
-    if (current_obstacle_msg && !current_obstacle_msg->targets.empty()) {
-        for (const auto &target : current_obstacle_msg->targets) {
-            if (target.type == "parking_sign" && !target.rois.empty() &&
-                target.rois[0].confidence >= parking_sign_confidence_threshold_) {
-                
-                int bottom_y = target.rois[0].rect.y_offset + target.rois[0].rect.height / 2;
-                if (bottom_y >= parking_y_threshold_) {
-                    RCLCPP_FATAL(this->get_logger(), "PARKING CONDITION MET! Sign bottom at Y=%d >= %d. Stopping now.", 
-                                 bottom_y, parking_y_threshold_);
-                    current_state_ = State::PARKED;
-                    parking_condition_met = true;
-                    break;
-                }
-            }
-        }
+    // 最高优先级：检查是否满足停车条件
+    if (isParkingConditionMet(current_obstacle_msg)) {
+            RCLCPP_FATAL(this->get_logger(), "满足停车条件！正在停止。");
+            current_state_ = State::PARKED;
+            publisher_->publish(geometry_msgs::msg::Twist());
+            continue;
     }
     
-    if (parking_condition_met) {
-        publisher_->publish(twist_msg);
-        continue;
-    }
+    // 第二优先级：检查是否有需要躲避的障碍物
+    auto obstacle_to_avoid = findAvoidanceObstacle(current_obstacle_msg);
+    // 检查是否有任何可以跟随的目标（线或停车标志）
+    bool has_primary_target = hasValidTrackLine(current_line_msg) || findFollowableParkingSign(current_obstacle_msg).has_value();
 
-    // 状态机决策
-    bool obstacle_detected_and_close = false;
-    ai_msgs::msg::Target relevant_obstacle_target;
-
-    // 检查障碍物是否近到需要避障
-    if (current_obstacle_msg && !current_obstacle_msg->targets.empty()) {
-        for(const auto &target : current_obstacle_msg->targets){
-            if(target.type == "construction_cone" && !target.rois.empty()){
-                float obstacle_conf = target.rois[0].confidence;
-                int bottom = target.rois[0].rect.y_offset + target.rois[0].rect.height;
-                // Only trigger avoidance if the obstacle is past the AVOID threshold
-                if (obstacle_conf >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_avoid_) {
-                    obstacle_detected_and_close = true;
-                    relevant_obstacle_target = target;
-                    if (current_state_ != State::OBSTACLE_AVOIDING) {
-                        RCLCPP_INFO(this->get_logger(), "Obstacle past avoid_threshold (%d >= %d)! Switching to OBSTACLE_AVOIDING.",
-                                    bottom, bottom_threshold_avoid_);
-                        current_state_ = State::OBSTACLE_AVOIDING;
-                    }
-                    break;
-                }
-            }
+    // --- 状态转换逻辑 ---
+    bool should_force_avoidance = obstacle_to_avoid.has_value();
+    if (current_state_ == State::RECOVERING_LINE && obstacle_to_avoid) {
+        // 如果当前正在回线，只有当新障碍物出现在回线同侧时，才需要再次进入避障
+        if (!isObstacleOnRecoverySide(*obstacle_to_avoid)) {
+            RCLCPP_INFO(this->get_logger(), "回线时发现异侧障碍物，忽略，继续回线。");
+            should_force_avoidance = false; // 覆盖决定，不强制避障
         }
     }
+
+    if (should_force_avoidance && current_state_ != State::OBSTACLE_AVOIDING) {
+        RCLCPP_INFO(this->get_logger(), "障碍物过近！强制切换到避障模式。");
+        current_state_ = State::OBSTACLE_AVOIDING;
+        has_valid_twist_ = false; // 旧指令失效
+    }
     
-    // 根据当前状态执行动作
+    // 2. 根据当前状态执行动作
     switch(current_state_) {
 
       case State::OBSTACLE_AVOIDING:
-        if (obstacle_detected_and_close) {
+        if (obstacle_to_avoid) {
           // 持续检测到障碍物，执行避障
-          ObstaclesAvoiding(relevant_obstacle_target);
+          ObstaclesAvoiding(*obstacle_to_avoid);
         } else {
           // 结束避障，重置转弯方向
           last_avoidance_direction_ = 0.0f;
           RCLCPP_INFO(this->get_logger(), "Obstacle no longer detected. Deciding next state...");
-
-          // 检查是否存在任何主要目标（线或停车标志）
-          if (hasVisiblePrimaryTarget()) {
-              // 看到了清晰的赛道线或停车标志，切回巡线模式
+          // 如果看得到主目标，就去巡线；否则就去寻找赛道
+          if (has_primary_target) {
               current_state_ = State::LINE_FOLLOWING;
-              RCLCPP_INFO(this->get_logger(), "Primary target (Line or Sign) found! Switching to LINE_FOLLOWING.");
+              RCLCPP_INFO(this->get_logger(), "Primary target found! Switching to LINE_FOLLOWING.");
           } else {
-              // 两个都没看到，进入寻找赛道状态
               current_state_ = State::RECOVERING_LINE;
               RCLCPP_INFO(this->get_logger(), "No clear target. Switching to RECOVERING_LINE.");
           }
@@ -230,76 +204,65 @@ void RacingControlNode::MessageProcess(){
         break;
 
       case State::RECOVERING_LINE:
+        last_avoidance_direction_ = 0.0f;
         RCLCPP_INFO(this->get_logger(), "In RECOVERING_LINE state, trying to find a target.");
         
         // 检查是否已找到任何主要目标（线或停车标志）
-        if (hasVisiblePrimaryTarget()) {
-          // 找到 -> 切换回巡线状态
+        if (has_primary_target) {
+          // 找到了，切换回巡线状态
           current_state_ = State::LINE_FOLLOWING;
           RCLCPP_INFO(this->get_logger(), "Primary target (Line or Sign) found! Switching back to LINE_FOLLOWING.");
         } else {
-          // 未找到 -> 执行“反向转弯”寻找赛道
-          twist_msg.linear.x = recovering_linear_speed_;
+          // 检查是否存在障碍物且 bottom >= bottom_threshold_caution_
+          auto twist_msg = geometry_msgs::msg::Twist();
+          bool slow_down_for_obstacle = false;
+          // 我们需要检查是否有障碍物进入了谨慎区域
+          if (current_obstacle_msg && !current_obstacle_msg->targets.empty()) {
+              for (const auto& target : current_obstacle_msg->targets) {
+                  if (target.type == "construction_cone" && !target.rois.empty()) {
+                      int bottom = target.rois[0].rect.y_offset + target.rois[0].rect.height;
+                      if (target.rois[0].confidence >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_caution_) {
+                          // 发现一个谨慎区障碍物，现在检查它是否在回线同侧
+                          if (isObstacleOnRecoverySide(target)) {
+                              slow_down_for_obstacle = true;
+                              RCLCPP_WARN(this->get_logger(), "回线时，同侧发现谨慎区障碍物，减速！");
+                              break; // 找到一个就够了
+                          }
+                      }
+                  }
+              }
+          }
+          twist_msg.linear.x = slow_down_for_obstacle ? avoid_linear_speed_ : recovering_linear_speed_;
           twist_msg.angular.z = -1.0 * std::copysign(recovering_angular_ratio_, last_avoidance_angular_z_);
-          RCLCPP_INFO(this->get_logger(), "Recovering with Ang_Z: %f", twist_msg.angular.z);
+          RCLCPP_INFO(this->get_logger(), "Recovering with linear speed: %.2f, angular z: %f", twist_msg.linear.x, twist_msg.angular.z);
           publisher_->publish(twist_msg);
         }
         break;
 
       case State::LINE_FOLLOWING:
-        // 在巡线状态，也要检查障碍物，因为障碍物可能突然出现
-        if (obstacle_detected_and_close) {
-            current_state_ = State::OBSTACLE_AVOIDING;
-            has_valid_twist_ = false; // 进入避障时，旧的巡线指令失效
-            ObstaclesAvoiding(relevant_obstacle_target);
-        } 
-        else {
-          // 正常巡线，但需要检查是否进入了“谨慎区域”
-          float target_linear_speed = follow_linear_speed_;
+        { 
+          // 使用 isObstacleInCautionZone() 辅助函数决定速度
+          float target_linear_speed = isObstacleInCautionZone(current_obstacle_msg) 
+                                        ? avoid_linear_speed_ 
+                                        : follow_linear_speed_;
 
-          if (current_obstacle_msg && !current_obstacle_msg->targets.empty()) {
-              for (const auto &target : current_obstacle_msg->targets) {
-                  if(target.type == "construction_cone" && !target.rois.empty()){
-                      int bottom = target.rois[0].rect.y_offset + target.rois[0].rect.height;
-                      if (target.rois[0].confidence >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_caution_) {
-                          target_linear_speed = 0.3 * avoid_linear_speed_;
-                          RCLCPP_INFO(this->get_logger(), "Obstacle in caution zone (%d >= %d). Slowing down to %.2f m/s.",
-                                      bottom, bottom_threshold_caution_, target_linear_speed);
-                          break;
-                      }
-                  }
-              }
-          }
-
-          // 获取赛道线信息
-          float line_confidence = 0.0f;
-          if (!current_line_msg->targets.empty() && 
-              !current_line_msg->targets[0].points.empty() && 
-              !current_line_msg->targets[0].points[0].confidence.empty()) {
-            line_confidence = current_line_msg->targets[0].points[0].confidence[0];
-          }
-
-          const auto& line_target_to_pass = current_line_msg->targets.empty() ? ai_msgs::msg::Target() : current_line_msg->targets[0];
-          
-          // 调用巡线函数，并传入最终决定的速度
-          bool target_followed = LineFollowing(line_target_to_pass, line_confidence, target_linear_speed);
-
-          if (!target_followed) {
+          if (!LineFollowing(target_linear_speed)) {
+            
             if (has_valid_twist_) {
-                RCLCPP_WARN(this->get_logger(), "No valid target found. Reusing last valid command.");
                 publisher_->publish(last_valid_twist_);
             } else {
-                RCLCPP_WARN(this->get_logger(), "No valid target and no history. Cruising straight.");
-                twist_msg.linear.x = cruise_linear_speed_;
-                twist_msg.angular.z = 0.0;
-                publisher_->publish(twist_msg);
+                // 如果没有任何历史指令，则执行低速直行
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "LineFollowing failed. No valid target. Executing fallback.");
+                auto cruise_msg = geometry_msgs::msg::Twist();
+                cruise_msg.linear.x = cruise_linear_speed_;
+                publisher_->publish(cruise_msg);
             }
           }
         }
         break;
       
-      default: 
-        publisher_->publish(twist_msg); 
+      default: // 包括 STOP 状态
+        publisher_->publish(geometry_msgs::msg::Twist()); // 发布停止指令
         break;
     }
 
@@ -309,84 +272,61 @@ void RacingControlNode::MessageProcess(){
 }
 
 // 巡线控制函数
-bool RacingControlNode::LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence, float target_linear_speed){
+bool RacingControlNode::LineFollowing(float target_linear_speed){
   
-  bool use_parking_sign = false;
   int target_x = 0;
   int target_y = 0;
   std::string log_reason;
-  bool target_found = false;
+  bool use_parking_sign = false;
 
-  // 优先检查是否存在高置信度的 "parking_sign"
-  {
-    std::unique_lock<std::mutex> lock(point_target_mutex_);
-    if (latest_targets_msg_ && !latest_targets_msg_->targets.empty()) {
-      for (const auto& target : latest_targets_msg_->targets) {
-        // 条件判断：类型是 parking_sign，有 ROI，且置信度大于等于阈值
-        if (target.type == "parking_sign" && !target.rois.empty() && 
-            target.rois[0].confidence >= parking_sign_confidence_threshold_) {
+  // 安全地获取最新消息
+  std::unique_lock<std::mutex> lock(point_target_mutex_);
+  auto current_line_msg = latest_point_msg_;
+  auto current_obstacle_msg = latest_targets_msg_;
+  lock.unlock();
 
-          target_x = target.rois[0].rect.x_offset + target.rois[0].rect.width / 2;
-          target_y = target.rois[0].rect.y_offset + target.rois[0].rect.height / 2;
-          use_parking_sign = true;
-          log_reason = "High-Conf Parking Sign";
-          break; 
-        }
-      }
-    }
-  }
-
-  // 决策最终使用哪个目标
-  if (use_parking_sign) {
-    // 如果找到了高置信度的停车标志，我们认为这是一个有效的目标
-    target_found = true;
-  } else if (line_confidence >= line_confidence_threshold_) {
-    // 如果没有停车标志，但赛道线置信度高，且数据有效
-    if (!line_target.points.empty() && !line_target.points[0].point.empty()) {
-        target_x = static_cast<int>(line_target.points[0].point[0].x);
-        target_y = static_cast<int>(line_target.points[0].point[0].y);
-        log_reason = "High-Conf Line";
-        target_found = true;
-    }
-  }
-
-  // 如果最终没有找到任何有效目标，则返回 false
-  if (!target_found) {
+  // 1. 决策使用哪个目标：优先使用停车标志
+  auto followable_sign = findFollowableParkingSign(current_obstacle_msg);
+  
+  if (followable_sign) {
+    // 如果找到了可以跟随的停车标志
+    target_x = followable_sign->rois[0].rect.x_offset + followable_sign->rois[0].rect.width / 2;
+    target_y = followable_sign->rois[0].rect.y_offset + followable_sign->rois[0].rect.height / 2;
+    use_parking_sign = true;
+    log_reason = "Parking Sign";
+  } else if (hasValidTrackLine(current_line_msg)) {
+    // 否则，如果找到了有效的赛道线
+    target_x = static_cast<int>(current_line_msg->targets[0].points[0].point[0].x);
+    target_y = static_cast<int>(current_line_msg->targets[0].points[0].point[0].y);
+    log_reason = "Track Line";
+  } else {
+    // 如果两者都找不到，则巡线失败
     return false;
   }
   
-  // 如果找到了目标，则计算并发布控制指令
+  // 2. 如果找到了目标，则计算并发布控制指令
   float center_offset = static_cast<float>(target_x) - 320.0f;
-  if (std::abs(center_offset) < 5.0f) { center_offset = 0.0f; }
+  float target_y_relative = (static_cast<float>(target_y) - 256.0f) / (480.0f - 256.0f);
   
   auto twist_msg = geometry_msgs::msg::Twist();
-  float target_y_relative = (static_cast<float>(target_y) - 256.0f) / (480.0f - 256.0f);
-  target_y_relative = std::max(0.0f, std::min(1.0f, target_y_relative));
-  
-  float angular_z = 0.0f;
-  if (use_parking_sign) {
-    angular_z = 2.0f * follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
-  } else {
-    angular_z = follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative; 
-  }
-
   twist_msg.linear.x = target_linear_speed;
-  twist_msg.angular.z = angular_z;
 
+  twist_msg.angular.z = (use_parking_sign ? 2.0f : 1.0f) * follow_angular_ratio_ * (center_offset / 320.0f) * target_y_relative;
+  
   last_valid_twist_ = twist_msg;
-  last_valid_twist_.linear.x = cruise_linear_speed_; 
-  last_valid_twist_.angular.z = std::copysign(10.0f, angular_z);
+  last_valid_twist_.linear.x = target_linear_speed; 
+  last_valid_twist_.angular.z = 3 * twist_msg.angular.z;
   has_valid_twist_ = true;
 
   publisher_->publish(twist_msg);
-  float sign_conf = use_parking_sign ? latest_targets_msg_->targets[0].rois[0].confidence : 0.0f;
   
-  RCLCPP_INFO(this->get_logger(), "Following %s -> X:%d, Y:%d, Ang_Z: %.2f, Lin_X: %.2f (LineConf: %.2f, SignConf: %.2f)", 
-              log_reason.c_str(), target_x, target_y, angular_z, target_linear_speed, line_confidence, sign_conf);
+  RCLCPP_INFO(this->get_logger(), "Following %s -> X:%d, Y:%d, Ang:%.2f, Lin:%.2f", 
+              log_reason.c_str(), target_x, target_y, twist_msg.angular.z, target_linear_speed);
 
   return true;
 }
 
+// 避障控制函数
 void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
   if (target.rois.empty() || target.rois[0].rect.width == 0) {
       RCLCPP_ERROR(this->get_logger(), "CRITICAL: ObstaclesAvoiding called with invalid ROI data!");
@@ -435,29 +375,98 @@ void RacingControlNode::ObstaclesAvoiding(const ai_msgs::msg::Target &target){
   RCLCPP_INFO(this->get_logger(), "Obstacles Avoiding -> CenterX:%d, Ang_Z: %f, Lin_X: %f", center_x, angular_z_avoid, avoid_linear_speed_);
 }
 
-bool RacingControlNode::hasVisiblePrimaryTarget() {
-    std::unique_lock<std::mutex> lock(point_target_mutex_);
+// 检查是否有有效的、高置信度的赛道线
+bool RacingControlNode::hasValidTrackLine(const ai_msgs::msg::PerceptionTargets::SharedPtr& line_msg) const {
+    return line_msg && !line_msg->targets.empty() &&
+           !line_msg->targets[0].points.empty() &&
+           !line_msg->targets[0].points[0].confidence.empty() &&
+           line_msg->targets[0].points[0].confidence[0] >= line_confidence_threshold_;
+}
 
-    if (latest_point_msg_ && !latest_point_msg_->targets.empty() && 
-        !latest_point_msg_->targets[0].points.empty() && 
-        !latest_point_msg_->targets[0].points[0].confidence.empty() &&
-        latest_point_msg_->targets[0].points[0].confidence[0] >= line_confidence_threshold_) {
-        return true; 
-    }
-
-    if (latest_targets_msg_ && !latest_targets_msg_->targets.empty()) {
-        for (const auto& target : latest_targets_msg_->targets) {
+// 查找一个可以用来跟随的停车标志
+std::optional<ai_msgs::msg::Target> RacingControlNode::findFollowableParkingSign(const ai_msgs::msg::PerceptionTargets::SharedPtr& targets_msg) const {
+    if (targets_msg && !targets_msg->targets.empty()) {
+        for (const auto& target : targets_msg->targets) {
             if (target.type == "parking_sign" && !target.rois.empty() &&
                 target.rois[0].confidence >= parking_sign_confidence_threshold_) {
-                return true; 
+                return target; // 找到了，返回这个目标
             }
         }
     }
+    return std::nullopt; // 没找到
+}
 
+// 检查是否满足最终停车条件
+bool RacingControlNode::isParkingConditionMet(const ai_msgs::msg::PerceptionTargets::SharedPtr& targets_msg) const {
+    if (auto sign = findFollowableParkingSign(targets_msg)) {
+        // 首先要有一个能跟随的标志，然后检查它是否足够近
+        int sign_center_y = sign->rois[0].rect.y_offset + sign->rois[0].rect.height / 2;
+        return sign_center_y >= parking_y_threshold_;
+    }
     return false;
 }
 
+// 查找需要紧急避障的障碍物
+std::optional<ai_msgs::msg::Target> RacingControlNode::findAvoidanceObstacle(const ai_msgs::msg::PerceptionTargets::SharedPtr& targets_msg) const {
+    if (targets_msg && !targets_msg->targets.empty()) {
+        for (const auto& target : targets_msg->targets) {
+            if (target.type == "construction_cone" && !target.rois.empty()) {
+                int bottom = target.rois[0].rect.y_offset + target.rois[0].rect.height;
+                // 判断条件：置信度足够高 且 底部超过了避障阈值
+                if (target.rois[0].confidence >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_avoid_) {
+                    return target; // 找到了，返回它
+                }
+            }
+        }
+    }
+    return std::nullopt;
+}
 
+// 检查是否有障碍物进入了“谨慎区域”（需要减速）
+bool RacingControlNode::isObstacleInCautionZone(const ai_msgs::msg::PerceptionTargets::SharedPtr& targets_msg) const {
+    if (targets_msg && !targets_msg->targets.empty()) {
+        for (const auto& target : targets_msg->targets) {
+            if (target.type == "construction_cone" && !target.rois.empty()) {
+                int bottom = target.rois[0].rect.y_offset + target.rois[0].rect.height;
+                // 判断条件：置信度足够高 且 底部超过了谨慎阈值
+                if (target.rois[0].confidence >= obstacle_confidence_threshold_ && bottom >= bottom_threshold_caution_) {
+                    return true; // 找到了
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// 检查障碍物是否在回线方向的同侧
+bool RacingControlNode::isObstacleOnRecoverySide(const ai_msgs::msg::Target& obstacle) const {
+    if (last_avoidance_angular_z_ == 0.0f || obstacle.rois.empty()) {
+        // 如果没有记录避障方向，或者障碍物信息无效，默认认为不在同侧（安全起见，不触发特殊逻辑）
+        return false;
+    }
+
+    int obstacle_center_x = obstacle.rois[0].rect.x_offset + obstacle.rois[0].rect.width / 2;
+    const int screen_center_x = 320;
+
+    // last_avoidance_angular_z_ < 0 表示上次向左转避障，现在需要向右回线
+    // 此时我们只关心右侧 (x > 320) 的新障碍物
+    bool recovering_right = last_avoidance_angular_z_ > 0;
+    if (recovering_right && obstacle_center_x > screen_center_x) {
+        return true;
+    }
+
+    // last_avoidance_angular_z_ > 0 表示上次向右转避障，现在需要向左回线
+    // 此时我们只关心左侧 (x < 320) 的新障碍物
+    bool recovering_left = last_avoidance_angular_z_ < 0;
+    if (recovering_left && obstacle_center_x < screen_center_x) {
+        return true;
+    }
+
+    // 其他情况（如向右回线时，障碍物在左边）都返回 false
+    return false;
+}
+
+// 主函数
 int main(int argc, char* argv[]) {
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<RacingControlNode>("racing_control"));

@@ -2,6 +2,7 @@
 #define RACING_CONTROL_H_
 
 #include <vector>
+#include <optional>
 #include <queue>
 #include <mutex>
 #include <thread>
@@ -52,10 +53,15 @@ private:
     void subscription_callback_target(const ai_msgs::msg::PerceptionTargets::SharedPtr targets_msg);
     // 处理 /sign4return 消息的回调函数
     void sign_callback(const std_msgs::msg::Int32::SharedPtr msg);
-    bool LineFollowing(const ai_msgs::msg::Target &line_target, float line_confidence, float target_linear_speed);
+    bool LineFollowing(float target_linear_speed);
     void ObstaclesAvoiding(const ai_msgs::msg::Target &obstacle_target);
     void MessageProcess(void);
-    bool hasVisiblePrimaryTarget();
+    bool hasValidTrackLine(const ai_msgs::msg::PerceptionTargets::SharedPtr& line_msg) const; //检查赛道线消息是否有效且置信度足够高
+    std::optional<ai_msgs::msg::Target> findFollowableParkingSign(const ai_msgs::msg::PerceptionTargets::SharedPtr& targets_msg) const; //查找一个置信度足够高、适合用于跟随的停车标志
+    bool isParkingConditionMet(const ai_msgs::msg::PerceptionTargets::SharedPtr& targets_msg) const;  //检查是否满足最终的停车条件（即停车标志足够近）
+    std::optional<ai_msgs::msg::Target> findAvoidanceObstacle(const ai_msgs::msg::PerceptionTargets::SharedPtr& targets_msg) const; //查找一个距离足够近、需要立即执行避障的障碍物
+    bool isObstacleInCautionZone(const ai_msgs::msg::PerceptionTargets::SharedPtr& targets_msg) const;  //检查是否有障碍物进入了需要减速的“谨慎区域”
+    bool isObstacleOnRecoverySide(const ai_msgs::msg::Target& obstacle) const; // 检查障碍物是否在回线方向的同侧
     
     std::string pub_control_topic_ = "cmd_vel";
     std::mutex point_target_mutex_;
