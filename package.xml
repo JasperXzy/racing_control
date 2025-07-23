@@ -4,7 +4,7 @@
   <name>racing_control</name>
   <version>2.0.0</version>
   <description>racing control</description>
-  <maintainer email="nuo.wu@horizon.cc">nuo.wu</maintainer>
+  <maintainer email="jasper.zhengyi.xu@gmail.com">Zhengyi Xu</maintainer>
   <license>Apache License 2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
